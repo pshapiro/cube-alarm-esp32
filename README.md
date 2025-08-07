@@ -110,6 +110,37 @@ sudo systemctl start nginx
 
 You can purchase the GAN cube used for this project here: [GAN Smart Cube](https://amzn.to/4lgux9D).
 
+## ESP32 Touchscreen Port
+
+An initial MicroPython port targeting the **ESP32-2432S022C** board
+with built‑in 2.2" capacitive touchscreen is available under the
+[`esp32/`](esp32/) directory.  The port drives a MAX98357A I2S audio
+amplifier for alarm playback and uses the ST7789 display controller. A
+simple UI shows the current time, two editable alarms, and cube
+connection/scramble status.
+
+### Quick start
+
+1. Flash [MicroPython](https://micropython.org/download/ESP32_GENERIC/)
+   onto the board.
+2. Copy `esp32/*.py` and `sounds/alarm.wav` to the device's filesystem.
+3. Wire a MAX98357A module to the default I2S pins:
+
+   | Signal | ESP32 Pin |
+   | ------ | --------- |
+   | `BCLK` | GPIO14    |
+   | `LRC`  | GPIO15    |
+   | `DIN`  | GPIO32    |
+
+4. Reset the board – the home screen shows the current time, two alarm
+   slots, and cube status. Tap the top area to set the time or the bottom
+   corners to configure alarms. The alarm sound plays when a scheduled
+   time is reached and stops on touch.
+
+The MicroPython port is a work in progress; BLE integration with the
+GAN cube and a full alarm scheduler are still to be implemented so cube
+status is currently a placeholder.
+
 ## API Endpoints
 
 The backend exposes a small set of HTTP routes for managing alarms and cube state.
