@@ -1,14 +1,10 @@
 # main.py — Pico W BLE central for GAN cube
 # Requires gan_mpy.py with: derive_key_iv_from_mac(mac_str) and decrypt_packet(cipher_bytes, key, iv)
 
-print("=== CUBE ALARM STARTING ===")
-
 try:
     import ubluetooth as bluetooth
-    print("BLE: Using ubluetooth")
 except ImportError:
     import bluetooth
-    print("BLE: Using bluetooth")
 import time
 import _thread
 from micropython import const
@@ -21,7 +17,8 @@ from audio_alarm import AudioAlarm
 
 SCAN_MS     = const(10000)  # 10 s active scan
 KNOWN_MAC   = "CF:AA:79:C9:96:9C"  # <- your cube's public MAC (normal big‑endian)
-DEBUG_SCAN  = const(1)
+DEBUG_SCAN  = const(0)
+DEBUG_SCAN_RATE_MS = const(200)  # throttle when DEBUG_SCAN is enabled
 
 # GAN Gen3 UUIDs
 SERVICE_UUID = bluetooth.UUID('8653000a-43e6-47b7-9cb0-5fc21d4ae340')
@@ -42,8 +39,7 @@ FLAG_NOTIFY                       = getattr(bluetooth, "FLAG_NOTIFY", const(0x10
 
 # --- Globals -----------------------------------------------------------------
 
-ble = bluetooth.BLE()
-ble.active(True)
+ble = None  # created and activated inside run()
 
 _key = None
 _iv  = None
@@ -70,7 +66,13 @@ _facelets_retry_next_ms = 0
 # Rate limiting for facelets polling after moves (ms)
 _facelets_rate_next_ms = 0
 # Enable detailed facelets debugging logs
-_DBG_FACELETS = True
+_DBG_FACELETS = False
+# Throttle for scan debug prints
+_scan_dbg_next_ms = 0
+
+# Packet debug printing (throttled)
+_DBG_PACKETS = False
+_pkt_dbg_next_ms = 0
 
 # OLED UI (128x32 I2C1 GP2/GP3)
 _oled = None
@@ -81,6 +83,7 @@ _ui_thread_running = False
 _buttons_thread_running = False
 _btn_a = None
 _btn_b = None
+_ui_last_sec = -1
 _btn_a_last = 1
 _btn_b_last = 1
 _btn_a_next_ok_ms = 0
@@ -208,6 +211,55 @@ def _buttons_loop():
         time.sleep_ms(80)
 
 
+def _poll_tick():
+    """Single cooperative tick: UI draw, buttons, audio, and deferred facelets writes."""
+    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _facelets_retry_count, _facelets_retry_next_ms
+    try:
+        # UI draw once per second or when marked dirty
+        now = time.localtime()
+        if (now[5] != _ui_last_sec) or _ui_dirty:
+            _ui_draw(now)
+            _ui_dirty = False
+            _ui_last_sec = now[5]
+
+        # Buttons and deferred tasks
+        now_ms = time.ticks_ms()
+        if _btn_a is not None:
+            a = _btn_a.value()
+            if _btn_a_last == 1 and a == 0 and time.ticks_diff(now_ms, _btn_a_next_ok_ms) >= 0:
+                send_request_facelets()
+                _btn_a_next_ok_ms = time.ticks_add(now_ms, 200)
+            _btn_a_last = a
+        if _btn_b is not None:
+            b = _btn_b.value()
+            if _btn_b_last == 1 and b == 0 and time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
+                send_request_reset()
+                _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
+            _btn_b_last = b
+
+        # Service audio alarm
+        if _alarm_on and _audio:
+            try:
+                _audio.poll()
+            except Exception:
+                pass
+
+        # Process deferred facelets write retries scheduled from IRQ
+        if (_conn is not None) and (_cmd_handle is not None) and (_facelets_retry_count > 0):
+            if time.ticks_diff(now_ms, _facelets_retry_next_ms) >= 0:
+                ok = send_request_facelets()
+                _facelets_retry_count -= 1
+                try:
+                    _facelets_retry_next_ms = time.ticks_add(now_ms, 200)
+                except Exception:
+                    _facelets_retry_next_ms = now_ms + 200
+                try:
+                    print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 def _bits_from_bytes(data):
     """Convert a bytes object to a string of bits (MicroPython compatible)."""
     bits = []
@@ -225,47 +277,205 @@ def get_bits(bit_string, start_bit, num_bits):
         return -1 # Indicate error
     return int(bit_string[start_bit:end_bit], 2)
 
-def _is_solved_facelets(clear: bytes) -> bool:
-    """Return True if a decrypted packet indicates solved state (19B compressed bit fields)."""
+def _bits_from_bytes_revbits(data):
+    """Build bit string with per-byte bit order reversed (LSB-first within each byte)."""
+    bits = []
+    for byte in data:
+        s = bin(byte)[2:]
+        s = ('0' * (8 - len(s)) + s)
+        bits.append(s[::-1])
+    return "".join(bits)
+
+def _reverse_bytes(data):
     try:
-        # GAN protocol: 19-byte packets are facelets packets
+        return bytes(data[::-1])
+    except Exception:
+        # Fallback for memoryview
+        b = bytes(data)
+        return bytes([b[i] for i in range(len(b) - 1, -1, -1)])
+
+def _swap_nibbles_bytes(data):
+    out = bytearray(len(data))
+    for i, byte in enumerate(data):
+        out[i] = ((byte & 0x0F) << 4) | ((byte & 0xF0) >> 4)
+    return bytes(out)
+
+def _rotl1_per_byte(data):
+    out = bytearray(len(data))
+    for i, byte in enumerate(data):
+        out[i] = ((byte << 1) & 0xFF) | ((byte >> 7) & 0x01)
+    return bytes(out)
+
+def _parse_facelets_arrays_from_bitstr(bit_string, base_shift_bits=0):
+    """Parse CP/CO/EP/EO from a bit_string given a base bit shift.
+
+    Returns (cp, co, ep, eo) if valid; otherwise returns None.
+    Valid means:
+      - CP is a permutation of 0..7
+      - CO are all in 0..2
+      - EP is a permutation of 0..11
+      - EO are all in 0..1
+    """
+    # Compute field starts with shift applied
+    cp_start = 40 + base_shift_bits
+    co_start = 61 + base_shift_bits
+    ep_start = 77 + base_shift_bits
+    eo_start = 121 + base_shift_bits
+
+    # Bounds check to avoid Python negative indexing surprises
+    if cp_start < 0 or co_start < 0 or ep_start < 0 or eo_start < 0:
+        return None
+    if eo_start + 11 > len(bit_string):
+        return None
+
+    cp = []
+    co = []
+    ep = []
+    eo = []
+
+    # Extract raw fields
+    for i in range(7):
+        vcp = get_bits(bit_string, cp_start + i * 3, 3)
+        vco = get_bits(bit_string, co_start + i * 2, 2)
+        if vcp < 0 or vco < 0:
+            return None
+        cp.append(vcp)
+        co.append(vco)
+
+    for i in range(11):
+        vep = get_bits(bit_string, ep_start + i * 4, 4)
+        veo = get_bits(bit_string, eo_start + i, 1)
+        if vep < 0 or veo < 0:
+            return None
+        ep.append(vep)
+        eo.append(veo)
+
+    # Derive last elements
+    cp.append(28 - sum(cp))
+    co.append((3 - (sum(co) % 3)) % 3)
+    ep.append(66 - sum(ep))
+    eo.append((2 - (sum(eo) % 2)) % 2)
+
+    # Validate ranges and permutations
+    if not (len(cp) == 8 and min(cp) >= 0 and max(cp) <= 7 and set(cp) == set(range(8))):
+        return None
+    if not (len(co) == 8 and all(0 <= x <= 2 for x in co)):
+        return None
+    if not (len(ep) == 12 and min(ep) >= 0 and max(ep) <= 11 and set(ep) == set(range(12))):
+        return None
+    if not (len(eo) == 12 and all(0 <= x <= 1 for x in eo)):
+        return None
+
+    return (cp, co, ep, eo)
+
+def _parse_facelets_canonical(clear: bytes):
+    """Canonical Gen3 facelets parse for headerless 19-byte plaintext.
+
+    Uses backend bit positions with a -16 bit shift (0x55 0x02 header removed):
+      CP start=24, CO start=45, EP start=61, EO start=105.
+    Returns (cp, co, ep, eo) if valid, else None.
+    """
+    try:
         if len(clear) < 19:
-            return False
+            return None
+        bits = _bits_from_bytes(clear)  # MSB-first per byte
+        return _parse_facelets_arrays_from_bitstr(bits, -16)
+    except Exception:
+        return None
 
-        # Convert the packet to a bit string once, matching backend logic for reliability.
-        bit_string = _bits_from_bytes(clear)
+def _parse_facelets_with_variants(clear: bytes):
+    """Try multiple bit order/offset variants and return the first valid parse.
 
-        # Parse using correct bit positions from reference driver
+    Returns tuple: (cp, co, ep, eo, variant_label)
+    If none validate, returns (None, None, None, None, label) where label describes attempts.
+    """
+    variants = []
+    try:
+        variants.append(("norm", _bits_from_bytes(clear)))
+    except Exception:
+        pass
+    try:
+        variants.append(("rev_bytes", _bits_from_bytes(_reverse_bytes(clear))))
+    except Exception:
+        pass
+    try:
+        variants.append(("rev_bits", _bits_from_bytes_revbits(clear)))
+    except Exception:
+        pass
+    try:
+        variants.append(("rev_bytes+rev_bits", _bits_from_bytes_revbits(_reverse_bytes(clear))))
+    except Exception:
+        pass
+    try:
+        variants.append(("swap_nibbles", _bits_from_bytes(_swap_nibbles_bytes(clear))))
+    except Exception:
+        pass
+    try:
+        variants.append(("rotl1_per_byte", _bits_from_bytes(_rotl1_per_byte(clear))))
+    except Exception:
+        pass
+    try:
+        variants.append(("rev_all_bits", _bits_from_bytes(clear)[::-1]))
+    except Exception:
+        pass
+
+    # Base shifts to cover header/prefix stripping and small padding
+    base_shifts = [-48, -40, -32, -24, -16, -8, 0, 8, 16, 24]
+
+    # Small jitter search to account for off-by-few-bits misalignment
+    jitters = [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+
+    for (label, bits) in variants:
+        for base in base_shifts:
+            for j in jitters:
+                shift = base + j
+                parsed = _parse_facelets_arrays_from_bitstr(bits, shift)
+                if parsed:
+                    return parsed[0], parsed[1], parsed[2], parsed[3], "%s shift=%d" % (label, shift)
+
+    # As a last resort, return default (non-validated) parse to preserve prior behavior
+    try:
+        bits_default = _bits_from_bytes(clear)
         cp = []
         co = []
         ep = []
         eo = []
-
-        # CP (Corners 0-6): 3 bits each, starting at bit 40.
         for i in range(7):
-            cp.append(get_bits(bit_string, 40 + i * 3, 3))
-        # CO (Corners 0-6): 2 bits each, starting at bit 61.
-        for i in range(7):
-            co.append(get_bits(bit_string, 61 + i * 2, 2))
-
-        # EP (Edges 0-10): 4 bits each, starting at bit 75.
+            cp.append(get_bits(bits_default, 40 + i * 3, 3))
+            co.append(get_bits(bits_default, 61 + i * 2, 2))
         for i in range(11):
-            ep.append(get_bits(bit_string, 77 + i * 4, 4))
-        # EO (Edges 0-10): 1 bit each, starting at bit 121.
-        for i in range(11):
-            eo.append(get_bits(bit_string, 121 + i, 1))
-
-        # The last piece is calculated from the sum of the others.
+            ep.append(get_bits(bits_default, 77 + i * 4, 4))
+            eo.append(get_bits(bits_default, 121 + i, 1))
         cp.append(28 - sum(cp))
         co.append((3 - (sum(co) % 3)) % 3)
         ep.append(66 - sum(ep))
         eo.append((2 - (sum(eo) % 2)) % 2)
+        return cp, co, ep, eo, "default-unaligned"
+    except Exception:
+        return None, None, None, None, "parse-failed"
 
-        # A solved cube has all permutations and orientations in order (0,1,2,3... and all 0s)
-        is_cp_solved = (len(cp) == 8 and set(cp) == set(range(8)) and all(cp[i] == i for i in range(8)))
-        is_co_solved = (len(co) == 8 and all(o == 0 for o in co))
-        is_ep_solved = (len(ep) == 12 and set(ep) == set(range(12)) and all(ep[i] == i for i in range(12)))
-        is_eo_solved = (len(eo) == 12 and all(o == 0 for o in eo))
+def _is_solved_facelets(clear: bytes) -> bool:
+    """Return True if a decrypted packet indicates solved state (19B compressed bit fields)."""
+    try:
+        # Treat 19-byte (and sometimes 20-byte) packets as facelets candidates
+        if len(clear) < 19:
+            return False
+
+        # 1) Try canonical headerless parse first (backend bit layout - 16 bits)
+        parsed = _parse_facelets_canonical(clear)
+        if parsed:
+            cp, co, ep, eo = parsed
+        else:
+            # 2) Fallback to variant search
+            cp, co, ep, eo, _ = _parse_facelets_with_variants(clear)
+            if not cp:
+                return False
+
+        # A solved cube has all permutations and orientations in order (0..N-1 and all 0s)
+        is_cp_solved = (cp == list(range(8)))
+        is_co_solved = (co == [0] * 8)
+        is_ep_solved = (ep == list(range(12)))
+        is_eo_solved = (eo == [0] * 12)
 
         return is_cp_solved and is_co_solved and is_ep_solved and is_eo_solved
 
@@ -279,48 +489,59 @@ def _is_solved_facelets(clear: bytes) -> bool:
 def _debug_facelets(clear: bytes):
     """Debug helper: print CP/CO/EP/EO arrays from compressed bit fields."""
     try:
-        # Per memory, any 19-byte packet is a facelets packet. No header check needed.
         if len(clear) < 19:
             return
 
-        # Convert the packet to a bit string once for reliable parsing.
-        bit_string = _bits_from_bytes(clear)
-
-        cp = []
-        co = []
-        ep = []
-        eo = []
-
-        # CP (Corners 0-6): 3 bits each, starting at bit 40.
+        # Default parse (for comparison; backend positions with no shift)
+        bits_default = _bits_from_bytes(clear)
+        cp_d = []
+        co_d = []
+        ep_d = []
+        eo_d = []
         for i in range(7):
-            cp.append(get_bits(bit_string, 40 + i * 3, 3))
-        # CO (Corners 0-6): 2 bits each, starting at bit 61.
-        for i in range(7):
-            co.append(get_bits(bit_string, 61 + i * 2, 2))
-
-        # EP (Edges 0-10): 4 bits each, starting at bit 75.
+            cp_d.append(get_bits(bits_default, 40 + i * 3, 3))
+            co_d.append(get_bits(bits_default, 61 + i * 2, 2))
         for i in range(11):
-            ep.append(get_bits(bit_string, 77 + i * 4, 4))
-        # EO (Edges 0-10): 1 bit each, starting at bit 121.
-        for i in range(11):
-            eo.append(get_bits(bit_string, 121 + i, 1))
-        # The last piece is calculated from the sum of the others.
-        cp.append(28 - sum(cp))
-        co.append((3 - (sum(co) % 3)) % 3)
-        ep.append(66 - sum(ep))
-        eo.append((2 - (sum(eo) % 2)) % 2)
+            ep_d.append(get_bits(bits_default, 77 + i * 4, 4))
+            eo_d.append(get_bits(bits_default, 121 + i, 1))
+        cp_d.append(28 - sum(cp_d))
+        co_d.append((3 - (sum(co_d) % 3)) % 3)
+        ep_d.append(66 - sum(ep_d))
+        eo_d.append((2 - (sum(eo_d) % 2)) % 2)
 
-        # Check if parsing produces valid values
-        valid_cp = len(cp) == 8 and set(cp) == set(range(8))
-        valid_co = len(co) == 8 and all(0 <= x <= 2 for x in co)
-        valid_ep = len(ep) == 12 and set(ep) == set(range(12))
-        valid_eo = len(eo) == 12 and all(0 <= x <= 1 for x in eo)
+        # Canonical headerless parse (preferred)
+        parsed_canon = _parse_facelets_canonical(clear)
+        if parsed_canon:
+            cp_c, co_c, ep_c, eo_c = parsed_canon
+        else:
+            cp_c = co_c = ep_c = eo_c = None
+
+        # Variant search parse (validated)
+        cp, co, ep, eo, label = _parse_facelets_with_variants(clear)
+
+        # Validity checks
+        valid_cp = bool(cp and set(cp) == set(range(8)))
+        valid_co = bool(co and all(0 <= x <= 2 for x in co))
+        valid_ep = bool(ep and set(ep) == set(range(12)))
+        valid_eo = bool(eo and all(0 <= x <= 1 for x in eo))
 
         print("--- FACELETS DEBUG ---")
-        print("CP:", cp, "(valid:", valid_cp, ")")
-        print("CO:", co, "(valid:", valid_co, ")")
-        print("EP:", ep, "(valid:", valid_ep, ")")
-        print("EO:", eo, "(valid:", valid_eo, ")")
+        print("CLR:", len(clear), ":", _hex(clear))
+        print("Default CP:", cp_d)
+        print("Default CO:", co_d)
+        print("Default EP:", ep_d)
+        print("Default EO:", eo_d)
+        if cp_c:
+            print("Canon   CP:", cp_c)
+            print("Canon   CO:", co_c)
+            print("Canon   EP:", ep_c)
+            print("Canon   EO:", eo_c)
+        print("Variant:", label)
+        if cp:
+            print("Parsed  CP:", cp, "(valid:", valid_cp, ")")
+            print("Parsed  CO:", co, "(valid:", valid_co, ")")
+            print("Parsed  EP:", ep, "(valid:", valid_ep, ")")
+            print("Parsed  EO:", eo, "(valid:", valid_eo, ")")
         print("----------------------")
 
     except Exception as e:
@@ -410,7 +631,11 @@ def _send_command_payload(payload: bytes) -> bool:
             return False
         # mode=1: write without response
         ble.gattc_write(_conn, _cmd_handle, enc, 1)
-        print("TX ENC", len(enc), ":", _hex(enc))
+        if _DBG_PACKETS:
+            try:
+                print("TX ENC", len(enc), ":", _hex(enc))
+            except Exception:
+                pass
         return True
     except Exception as e:
         print("! gattc_write err:", e)
@@ -441,10 +666,11 @@ def _schedule_facelets_poll(delay_ms=50):
             _facelets_rate_next_ms = time.ticks_add(now_ms, 250)
         except Exception:
             _facelets_rate_next_ms = now_ms + 250
-        try:
-            print("Facelets poll scheduled")
-        except Exception:
-            pass
+        if _DBG_PACKETS:
+            try:
+                print("Facelets poll scheduled")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -516,7 +742,7 @@ def _start_next_char_discovery():
 
 def _on_notify(conn_handle, value_handle, data):
     # Decrypt each notification payload directly (supports 16–20+ byte frames)
-    global _alarm_on
+    global _alarm_on, _pkt_dbg_next_ms
     if conn_handle != _conn:
         return
     if not _key or not _iv:
@@ -537,7 +763,17 @@ def _on_notify(conn_handle, value_handle, data):
         print("! decrypt returned None for len", len(chunk))
         return
     # Good frames usually start with 0x55
-    print("CLR", len(clear), ":", _hex(clear))
+    if _DBG_PACKETS:
+        try:
+            now_ms = time.ticks_ms()
+            if time.ticks_diff(now_ms, _pkt_dbg_next_ms) >= 0:
+                print("CLR", len(clear), ":", _hex(clear))
+                try:
+                    _pkt_dbg_next_ms = time.ticks_add(now_ms, 250)
+                except Exception:
+                    _pkt_dbg_next_ms = now_ms + 250
+        except Exception:
+            pass
     # Update simple UI based on packet type - match backend logic
     if len(clear) == 19:
         # Per memory, any 19-byte packet is a facelets packet.
@@ -575,7 +811,7 @@ def _on_notify(conn_handle, value_handle, data):
 # --- IRQ ---------------------------------------------------------------------
 
 def _irq(event, data):
-    global _conn, _svc_ranges, _char_queue, _notify_handles, _key, _iv, _connecting, _audio, _alarm_on, _cmd_handle, _state_handle, _did_send_initial_facelets, _rx_buf, _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms
+    global _conn, _svc_ranges, _char_queue, _notify_handles, _key, _iv, _connecting, _audio, _alarm_on, _cmd_handle, _state_handle, _did_send_initial_facelets, _rx_buf, _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms, _scan_dbg_next_ms
 
     # Scan results
     if _is_scan_result_event(event, data):
@@ -583,7 +819,16 @@ def _irq(event, data):
         mac_h = _mac_norm_from_le(addr)  # human-friendly order
         mac_d = _mac_direct(addr)        # direct byte order
         if DEBUG_SCAN:
-            print("{:4d} dBm | {} | raw {}".format(rssi, mac_h, mac_d))
+            try:
+                now_ms = time.ticks_ms()
+                if time.ticks_diff(now_ms, _scan_dbg_next_ms) >= 0:
+                    print("{:4d} dBm | {} | raw {}".format(rssi, mac_h, mac_d))
+                    try:
+                        _scan_dbg_next_ms = time.ticks_add(now_ms, DEBUG_SCAN_RATE_MS)
+                    except Exception:
+                        _scan_dbg_next_ms = now_ms + DEBUG_SCAN_RATE_MS
+            except Exception:
+                pass
         if ((_norm(mac_h) == _norm(KNOWN_MAC)) or (_norm(mac_d) == _norm(KNOWN_MAC))) and (_conn is None) and (not _connecting):
             print("Found cube @", mac_h, "(raw", mac_d + ")", "RSSI", rssi)
             _connecting = True
@@ -741,16 +986,10 @@ def _irq(event, data):
             _start_next_char_discovery()
             # If discovery finished and we have a CMD handle, request facelets once
             if not _char_queue and (_cmd_handle is not None) and (not _did_send_initial_facelets):
-                ok = send_request_facelets()
                 _did_send_initial_facelets = True
-                print("Initial facelets requested:", ok)
-                if not ok:
-                    # Schedule up to 3 retries outside IRQ
-                    try:
-                        _facelets_retry_count = 3
-                        _facelets_retry_next_ms = time.ticks_add(time.ticks_ms(), 200)
-                    except Exception:
-                        _facelets_retry_count = 3
+                # Defer write outside IRQ to avoid EALREADY
+                _schedule_facelets_poll(80)
+                print("Initial facelets scheduled")
 
     # Notifications (forward to handler)
     elif event == _IRQ_GATTC_NOTIFY:
@@ -760,6 +999,16 @@ def _irq(event, data):
 # --- Run ---------------------------------------------------------------------
 
 def run():
+    global ble
+    print("=== CUBE ALARM STARTING ===")
+    try:
+        if ble is None:
+            ble = bluetooth.BLE()
+        ble.active(True)
+        print("BLE: active")
+    except Exception as e:
+        print("BLE init failed:", e)
+        return
     print("Pico W BLE central — GAN decrypt test")
     _ui_init()
     _buttons_init()
@@ -770,6 +1019,11 @@ def run():
     # Scan in 10s windows, auto-rescan in IRQ if not connected
     ble.gap_scan(SCAN_MS, 30000, 30000, True)
     print("Scanning {} ms windows… auto-rescanning until found.".format(SCAN_MS))
+    # Cooperative main loop to service buttons, audio, and deferred facelets requests
+    while True:
+        _poll_tick()
+        time.sleep_ms(5)
 
-# Auto-run enabled for testing
-run()
+# No auto-run on import; call run() manually when imported as a module.
+if __name__ == "__main__":
+    run()
