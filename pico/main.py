@@ -455,19 +455,25 @@ def _parse_facelets_with_variants(clear: bytes):
         return None, None, None, None, "parse-failed"
 
 def _is_solved_facelets(clear: bytes) -> bool:
-    """Return True if a decrypted packet indicates solved state (19B compressed bit fields)."""
+    """Return True if a decrypted packet (with or without 0x55 0x02 header) is solved."""
     try:
-        # Treat 19-byte (and sometimes 20-byte) packets as facelets candidates
-        if len(clear) < 19:
+        # Accept packets with GAN header and strip it if present
+        if len(clear) >= 21 and clear[0] == 0x55 and clear[1] == 0x02:
+            body = clear[2:]
+        else:
+            body = clear
+
+        # Need at least 19 bytes of facelets data (headerless)
+        if len(body) < 19:
             return False
 
         # 1) Try canonical headerless parse first (backend bit layout - 16 bits)
-        parsed = _parse_facelets_canonical(clear)
+        parsed = _parse_facelets_canonical(body)
         if parsed:
             cp, co, ep, eo = parsed
         else:
             # 2) Fallback to variant search
-            cp, co, ep, eo, _ = _parse_facelets_with_variants(clear)
+            cp, co, ep, eo, _ = _parse_facelets_with_variants(body)
             if not cp:
                 return False
 
@@ -775,8 +781,8 @@ def _on_notify(conn_handle, value_handle, data):
         except Exception:
             pass
     # Update simple UI based on packet type - match backend logic
-    if len(clear) == 19:
-        # Per memory, any 19-byte packet is a facelets packet.
+    if len(clear) >= 19 and clear[0] == 0x55 and clear[1] == 0x02:
+        # Facelets packet (state update)
         if _DBG_FACELETS:
             _debug_facelets(clear)
 
@@ -791,9 +797,9 @@ def _on_notify(conn_handle, value_handle, data):
                 except Exception:
                     pass
                 _alarm_on = False
-    elif len(clear) >= 16:
+    elif len(clear) >= 16 and clear[0] == 0x55:
         # 16-byte packets could be moves or other events
-        if len(clear) >= 2 and clear[0] == 0x55 and clear[1] == 0x02:
+        if clear[1] == 0x02 and len(clear) == 16:
             # 16B 0x02 move-variant
             mv = _parse_move_variant02(clear)
             if mv:
@@ -803,8 +809,8 @@ def _on_notify(conn_handle, value_handle, data):
                     pass
             _ui_text("Connected", "Move…")
             _schedule_facelets_poll(80)
-        elif len(clear) >= 2 and clear[0] == 0x55 and clear[1] == 0x01:
-            # Move packet
+        elif clear[1] == 0x01:
+            # Standard move packet
             _ui_text("Connected", "Move…")
             _schedule_facelets_poll(80)
 
