@@ -53,6 +53,8 @@ _conn = None
 _connecting = False
 _audio = None
 _alarm_on = False
+_char_discover_in_progress = False
+_ble_next_ok_ms = 0
 
 # GAN characteristic handles
 _cmd_handle = None
@@ -257,6 +259,21 @@ def _poll_tick():
                     print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
                 except Exception:
                     pass
+        # BLE op scheduling outside IRQ: enable CCCDs and advance discovery
+        if _conn is not None:
+            # Respect backoff between BLE ops
+            ready = True
+            try:
+                ready = time.ticks_diff(time.ticks_ms(), _ble_next_ok_ms) >= 0
+            except Exception:
+                pass
+            if ready:
+                # Prefer enabling pending CCCDs first
+                if _notify_handles and (not _char_discover_in_progress):
+                    vh = _notify_handles.pop(0)
+                    _enable_notify(_conn, vh)
+                else:
+                    _start_next_char_discovery()
     except Exception:
         pass
 
@@ -726,25 +743,50 @@ def _enable_notify(conn_handle, value_handle):
     try:
         ble.gattc_write(conn_handle, value_handle + 1, b"\x01\x00", 1)
         print("  CCCD enabled @", value_handle + 1)
+        # Backoff slightly after a write to avoid overlapping next GATT op
+        try:
+            now_ms = time.ticks_ms()
+            globals()['_ble_next_ok_ms'] = time.ticks_add(now_ms, 80)
+        except Exception:
+            globals()['_ble_next_ok_ms'] = (globals().get('_ble_next_ok_ms') or 0) + 80
     except Exception as e:
         print("  CCCD write failed:", e)
 
 def _start_next_char_discovery():
-    """Pop next service range and start characteristic discovery (one at a time)."""
-    global _char_queue
-    if not _char_queue or _conn is None:
+    """Pop next service range and start characteristic discovery (one at a time).
+
+    Called from the main loop to avoid kicking off new GATT ops inside the IRQ
+    handler, which can trigger EALREADY on some ports.
+    """
+    global _char_queue, _char_discover_in_progress, _ble_next_ok_ms
+    if not _char_queue or _conn is None or _char_discover_in_progress:
         return
+    # Respect a small backoff between ops
+    try:
+        if time.ticks_diff(time.ticks_ms(), _ble_next_ok_ms) < 0:
+            return
+    except Exception:
+        pass
     start, end = _char_queue.pop(0)
     try:
         ble.gattc_discover_characteristics(_conn, start, end)
-    except Exception as e:
-        # If EALREADY ever appears, wait a tick and retry once
-        print("  char discover err:", e)
-        time.sleep_ms(50)
+        _char_discover_in_progress = True
         try:
-            ble.gattc_discover_characteristics(_conn, start, end)
-        except Exception as e2:
-            print("  char discover retry failed:", e2)
+            _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 80)
+        except Exception:
+            _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 80
+    except Exception as e:
+        # If EALREADY ever appears, back off and retry later from main loop
+        try:
+            print("  char discover err:", e)
+        except Exception:
+            pass
+        try:
+            _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 100)
+        except Exception:
+            _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 100
+        # Push range back for a later retry
+        _char_queue.insert(0, (start, end))
 
 def _on_notify(conn_handle, value_handle, data):
     # Decrypt each notification payload directly (supports 16–20+ byte frames)
@@ -901,6 +943,8 @@ def _irq(event, data):
         _char_queue = []
         _notify_handles = []
         _rx_buf = b""
+        _char_discover_in_progress = False
+        _ble_next_ok_ms = 0
         # Reset deferred retry state
         _facelets_retry_count = 0
         _facelets_retry_next_ms = 0
@@ -932,6 +976,8 @@ def _irq(event, data):
             _svc_ranges = []
             _char_queue = []
             _notify_handles = []
+            _char_discover_in_progress = False
+            _ble_next_ok_ms = 0
             # Reset deferred retry state
             _facelets_retry_count = 0
             _facelets_retry_next_ms = 0
@@ -954,7 +1000,11 @@ def _irq(event, data):
             # queue all discovered service ranges and kick off first char discovery
             _char_queue = list(_svc_ranges)
             print("Services:", len(_char_queue), "ranges")
-            _start_next_char_discovery()
+            # Defer starting discovery to the main loop to avoid EALREADY inside IRQ
+            try:
+                _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 50)
+            except Exception:
+                _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 50
 
     # Characteristic discovery (one range at a time)
     elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
@@ -984,12 +1034,13 @@ def _irq(event, data):
     elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
         conn_handle, status = data
         if conn_handle == _conn:
-            # After finishing one range, start the next, and enable CCCD
-            # (enable once we have at least one NOTIFY handle)
-            while _notify_handles:
-                vh = _notify_handles.pop(0)
-                _enable_notify(_conn, vh)
-            _start_next_char_discovery()
+            # Mark end of this discovery range; main loop will enable CCCDs
+            # and start the next range with a small backoff to avoid EALREADY.
+            _char_discover_in_progress = False
+            try:
+                _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 50)
+            except Exception:
+                _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 50
             # If discovery finished and we have a CMD handle, request facelets once
             if not _char_queue and (_cmd_handle is not None) and (not _did_send_initial_facelets):
                 _did_send_initial_facelets = True
