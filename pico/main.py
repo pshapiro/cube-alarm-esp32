@@ -216,15 +216,18 @@ def _buttons_loop():
 def _poll_tick():
     """Single cooperative tick: UI draw, buttons, audio, and deferred facelets writes."""
     global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _facelets_retry_count, _facelets_retry_next_ms
+    # UI draw once per second or when marked dirty
     try:
-        # UI draw once per second or when marked dirty
         now = time.localtime()
         if (now[5] != _ui_last_sec) or _ui_dirty:
             _ui_draw(now)
             _ui_dirty = False
             _ui_last_sec = now[5]
+    except Exception:
+        pass
 
-        # Buttons and deferred tasks
+    # Buttons and deferred tasks
+    try:
         now_ms = time.ticks_ms()
         if _btn_a is not None:
             a = _btn_a.value()
@@ -259,7 +262,11 @@ def _poll_tick():
                     print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
                 except Exception:
                     pass
-        # BLE op scheduling outside IRQ: enable CCCDs and advance discovery
+    except Exception:
+        pass
+
+    # BLE op scheduling outside IRQ: enable CCCDs and advance discovery
+    try:
         if _conn is not None:
             # Respect backoff between BLE ops
             ready = True
@@ -769,6 +776,10 @@ def _start_next_char_discovery():
         pass
     start, end = _char_queue.pop(0)
     try:
+        try:
+            print("  discovering chars", start, "-", end)
+        except Exception:
+            pass
         ble.gattc_discover_characteristics(_conn, start, end)
         _char_discover_in_progress = True
         try:
