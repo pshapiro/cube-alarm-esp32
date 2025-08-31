@@ -1,30 +1,28 @@
 # gan_mpy.py — MicroPython helpers for GAN cube streams (Pico W)
-from ucryptolib import aes
+try:
+    from ucryptolib import aes
+except ImportError:
+    # Fallback alias on some ports
+    from cryptolib import aes
 
 BASE_KEY = bytes([0x01, 0x02, 0x42, 0x28, 0x31, 0x91, 0x16, 0x07, 0x20, 0x05, 0x18, 0x54, 0x42, 0x11, 0x12, 0x53])
 BASE_IV  = bytes([0x11, 0x03, 0x32, 0x28, 0x21, 0x01, 0x76, 0x27, 0x20, 0x95, 0x78, 0x14, 0x32, 0x12, 0x02, 0x43])
 
 def derive_key_iv_from_mac(mac_address: str):
     mac_clean = mac_address.replace(':', '').replace('-', '').upper()
-    
-    # Match backend exactly - use first 12 chars for UUID format
+    # For Pico W BLE (state/facelets notifications), using the MAC bytes in
+    # display order (no reversal) yields frames with 0x55 headers post-decrypt.
     if len(mac_clean) == 12:
-        # Traditional MAC address format (AA:BB:CC:DD:EE:FF)
         salt = bytes.fromhex(mac_clean)
     elif len(mac_clean) == 32:
-        # UUID format from macOS BLE - use FIRST 12 hex chars (6 bytes) for this cube variant
-        salt = bytes.fromhex(mac_clean[:12])  # Match backend: [:12] not [-12:]
+        salt = bytes.fromhex(mac_clean[:12])
     else:
         raise ValueError("Invalid MAC/UUID format: %r" % mac_address)
-        
-    # Match backend exactly - reverse salt bytes (MicroPython compatible)
-    n = len(salt)
-    salt = bytes([salt[i] for i in range(n - 1, -1, -1)])
 
     key = bytearray(BASE_KEY)
     iv  = bytearray(BASE_IV)
     for i in range(6):
-        # Match backend exactly - % 0xFF
+        # 0xFF modulo per JavaScript implementation
         key[i] = (BASE_KEY[i] + salt[i]) % 0xFF
         iv[i]  = (BASE_IV[i] + salt[i]) % 0xFF
     return bytes(key), bytes(iv)
@@ -33,43 +31,70 @@ def _cbc(key, iv):
     # mode=2 is CBC in MicroPython
     return aes(key, 2, iv)
 
+def _dec_last_first(src: bytes, key: bytes, iv: bytes) -> bytes:
+    n = len(src)
+    buf = bytearray(src)
+    # decrypt trailing 16 if present
+    if n > 16:
+        end = n - 16
+        c = _cbc(key, iv)
+        try:
+            buf[end:end+16] = c.decrypt(bytes(buf[end:end+16]))
+        except Exception:
+            return src
+    # decrypt leading 16
+    c = _cbc(key, iv)
+    try:
+        buf[0:16] = c.decrypt(bytes(buf[0:16]))
+    except Exception:
+        return src
+    return bytes(buf)
+
+def _dec_first_last(src: bytes, key: bytes, iv: bytes) -> bytes:
+    n = len(src)
+    buf = bytearray(src)
+    # decrypt leading 16
+    c = _cbc(key, iv)
+    try:
+        buf[0:16] = c.decrypt(bytes(buf[0:16]))
+    except Exception:
+        return src
+    # decrypt trailing 16 if present
+    if n > 16:
+        end = n - 16
+        c = _cbc(key, iv)
+        try:
+            buf[end:end+16] = c.decrypt(bytes(buf[end:end+16]))
+        except Exception:
+            return src
+    return bytes(buf)
+
 def decrypt_packet(pkt: bytes, key: bytes, iv: bytes) -> bytes:
     n = len(pkt)
     if n < 16:
         return None
-    buf = bytearray(pkt)
-    
-    # To prevent any state corruption in ucryptolib, decrypt the two chunks
-    # completely independently. The backend decrypts LAST then FIRST.
-    first_chunk_decrypted = None
-    last_chunk_decrypted = None
-
-    # 1. Decrypt last chunk (if it exists) into a temporary variable
-    if n > 16:
-        end_off = n - 16
-        c1 = _cbc(key, iv)
-        try:
-            last_chunk_decrypted = c1.decrypt(bytes(buf[end_off:end_off+16]))
-        except Exception as e:
-            print("! AES decrypt error (last chunk):", e)
-            return pkt
-
-    # 2. Decrypt first chunk into a temporary variable
-    c2 = _cbc(key, iv)
+    # Heuristics: if it already looks like a GAN frame, return as-is
     try:
-        first_chunk_decrypted = c2.decrypt(bytes(buf[0:16]))
-    except Exception as e:
-        print("! AES decrypt error (first chunk):", e)
-        return pkt
-
-    # 3. Now, write the decrypted chunks back into the buffer
-    if last_chunk_decrypted:
-        end_off = n - 16
-        buf[end_off:end_off+16] = last_chunk_decrypted
-    if first_chunk_decrypted:
-        buf[0:16] = first_chunk_decrypted
-        
-    return bytes(buf)
+        if pkt and pkt[0] == 0x55 and (n >= 2):
+            return pkt
+    except Exception:
+        pass
+    # Try backend order (last->first) first
+    d1 = _dec_last_first(pkt, key, iv)
+    try:
+        if d1 and d1[0] == 0x55:
+            return d1
+    except Exception:
+        pass
+    # Try alternate (first->last)
+    d2 = _dec_first_last(pkt, key, iv)
+    try:
+        if d2 and d2[0] == 0x55:
+            return d2
+    except Exception:
+        pass
+    # As a fallback, return d1 even if headerless; higher layers may still parse
+    return d1
 
 def encrypt_packet(data: bytes, key: bytes, iv: bytes) -> bytes:
     """Encrypt command data using dual-chunk CBC, matching backend behavior.

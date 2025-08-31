@@ -35,7 +35,9 @@ _IRQ_GATTC_SERVICE_DONE           = getattr(bluetooth, "_IRQ_GATTC_SERVICE_DONE"
 _IRQ_GATTC_CHARACTERISTIC_RESULT  = getattr(bluetooth, "_IRQ_GATTC_CHARACTERISTIC_RESULT", const(11))
 _IRQ_GATTC_CHARACTERISTIC_DONE    = getattr(bluetooth, "_IRQ_GATTC_CHARACTERISTIC_DONE", const(12))
 _IRQ_GATTC_NOTIFY                 = getattr(bluetooth, "_IRQ_GATTC_NOTIFY", const(18))
+_IRQ_GATTC_INDICATE               = getattr(bluetooth, "_IRQ_GATTC_INDICATE", const(20))
 FLAG_NOTIFY                       = getattr(bluetooth, "FLAG_NOTIFY", const(0x10))
+FLAG_INDICATE                     = getattr(bluetooth, "FLAG_INDICATE", const(0x20))
 
 # --- Globals -----------------------------------------------------------------
 
@@ -53,8 +55,14 @@ _conn = None
 _connecting = False
 _audio = None
 _alarm_on = False
-_char_discover_in_progress = False
+_char_discover_in_progress = False  # legacy var, not used in reverted flow
+_char_discover_start_ms = 0         # legacy var, not used in reverted flow
+_char_discover_item = None          # legacy var, not used in reverted flow
+_service_discover_in_progress = False
+_service_discover_start_ms = 0
+_service_discover_pending = False
 _ble_next_ok_ms = 0
+_initial_facelets_pending = False
 
 # GAN characteristic handles
 _cmd_handle = None
@@ -75,6 +83,56 @@ _scan_dbg_next_ms = 0
 # Packet debug printing (throttled)
 _DBG_PACKETS = False
 _pkt_dbg_next_ms = 0
+_last_solved = None
+_last_facelets_serial = -1
+_last_facelets_ms = 0
+
+# Facelets mapping (URFDLB order) for optional facelets string output
+_FACES_ORDER = "URFDLB"
+_CORNER_FACELET_MAP = [
+    (8, 9, 20),   # URF
+    (6, 18, 38),  # UFL
+    (0, 36, 47),  # ULB
+    (2, 45, 11),  # UBR
+    (29, 26, 15), # DFR
+    (27, 44, 24), # DLF
+    (33, 53, 42), # DBL
+    (35, 17, 51), # DRB
+]
+_EDGE_FACELET_MAP = [
+    (5, 10),   # UR
+    (7, 19),   # UF
+    (3, 37),   # UL
+    (1, 46),   # UB
+    (32, 16),  # DR
+    (28, 25),  # DF
+    (30, 43),  # DL
+    (34, 52),  # DB
+    (23, 12),  # FR
+    (21, 41),  # FL
+    (50, 39),  # BL
+    (48, 14),  # BR
+]
+
+# Kociemba solved facelets string (backend parity)
+_SOLVED_FACELETS = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB"
+
+def _to_kociemba_facelets(cp, co, ep, eo):
+    try:
+        facelets = [ _FACES_ORDER[i // 9] for i in range(54) ]
+        for i in range(8):
+            for p in range(3):
+                facelet_idx = _CORNER_FACELET_MAP[i][(p + co[i]) % 3]
+                corner_face_idx = _CORNER_FACELET_MAP[cp[i]][p] // 9
+                facelets[facelet_idx] = _FACES_ORDER[corner_face_idx]
+        for i in range(12):
+            for p in range(2):
+                facelet_idx = _EDGE_FACELET_MAP[i][(p + eo[i]) % 2]
+                edge_face_idx = _EDGE_FACELET_MAP[ep[i]][p] // 9
+                facelets[facelet_idx] = _FACES_ORDER[edge_face_idx]
+        return ''.join(facelets)
+    except Exception:
+        return None
 
 # OLED UI (128x32 I2C1 GP2/GP3)
 _oled = None
@@ -215,7 +273,8 @@ def _buttons_loop():
 
 def _poll_tick():
     """Single cooperative tick: UI draw, buttons, audio, and deferred facelets writes."""
-    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _facelets_retry_count, _facelets_retry_next_ms
+    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms
+    global _facelets_retry_count, _facelets_retry_next_ms
     try:
         # UI draw once per second or when marked dirty
         now = time.localtime()
@@ -259,21 +318,19 @@ def _poll_tick():
                     print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
                 except Exception:
                     pass
-        # BLE op scheduling outside IRQ: enable CCCDs and advance discovery
-        if _conn is not None:
-            # Respect backoff between BLE ops
-            ready = True
-            try:
-                ready = time.ticks_diff(time.ticks_ms(), _ble_next_ok_ms) >= 0
-            except Exception:
-                pass
-            if ready:
-                # Prefer enabling pending CCCDs first
-                if _notify_handles and (not _char_discover_in_progress):
-                    vh = _notify_handles.pop(0)
-                    _enable_notify(_conn, vh)
-                else:
-                    _start_next_char_discovery()
+        # If we haven't seen a new facelets in a while, proactively poll once
+        try:
+            if (_conn is not None) and (_cmd_handle is not None):
+                if (_last_facelets_ms == 0) or (time.ticks_diff(now_ms, _last_facelets_ms) > 1200):
+                    send_request_facelets()
+                    # avoid spamming; wait at least 800ms before next proactive poll
+                    try:
+                        _last_facelets_ms = time.ticks_add(now_ms, 800)
+                    except Exception:
+                        _last_facelets_ms = now_ms + 800
+        except Exception:
+            pass
+        # No BLE op scheduling here in reverted flow; discovery/CCCD handled in IRQ
     except Exception:
         pass
 
@@ -386,17 +443,67 @@ def _parse_facelets_arrays_from_bitstr(bit_string, base_shift_bits=0):
     return (cp, co, ep, eo)
 
 def _parse_facelets_canonical(clear: bytes):
-    """Canonical Gen3 facelets parse for headerless 19-byte plaintext.
+    """Canonical Gen3 facelets parse for headerless plaintext.
 
-    Uses backend bit positions with a -16 bit shift (0x55 0x02 header removed):
-      CP start=24, CO start=45, EP start=61, EO start=105.
+    Expects the 2-byte header 0x55 0x02 to be removed already, so
+    `clear` should typically be 17 bytes (19 total minus 2-byte header).
+
+    Uses backend bit positions with a -16 bit shift (header removed):
+      CP start=24, CO start=45, EP start=61, EO start=105 (relative to headered).
     Returns (cp, co, ep, eo) if valid, else None.
     """
     try:
-        if len(clear) < 19:
+        # 17 bytes of headerless data is sufficient
+        if len(clear) < 17:
             return None
         bits = _bits_from_bytes(clear)  # MSB-first per byte
         return _parse_facelets_arrays_from_bitstr(bits, -16)
+    except Exception:
+        return None
+
+def _parse_facelets_headered(clear: bytes):
+    """Parse CP/CO/EP/EO from a headered (0x55 0x02 + 17B) facelets packet.
+
+    Matches backend bit positions exactly: CP@40, CO@61, EP@77, EO@121.
+    Returns (cp, co, ep, eo) if valid; otherwise None.
+    """
+    try:
+        if len(clear) < 19 or clear[0] != 0x55 or clear[1] != 0x02:
+            return None
+        bits = _bits_from_bytes(clear)
+        # Same extraction as backend (first 7/11 values, derive last)
+        cp = []
+        co = []
+        ep = []
+        eo = []
+        for i in range(7):
+            vcp = get_bits(bits, 40 + i * 3, 3)
+            vco = get_bits(bits, 61 + i * 2, 2)
+            if vcp < 0 or vco < 0:
+                return None
+            cp.append(vcp)
+            co.append(vco)
+        for i in range(11):
+            vep = get_bits(bits, 77 + i * 4, 4)
+            veo = get_bits(bits, 121 + i, 1)
+            if vep < 0 or veo < 0:
+                return None
+            ep.append(vep)
+            eo.append(veo)
+        cp.append(28 - sum(cp))
+        co.append((3 - (sum(co) % 3)) % 3)
+        ep.append(66 - sum(ep))
+        eo.append((2 - (sum(eo) % 2)) % 2)
+        # Validate
+        if not (len(cp) == 8 and set(cp) == set(range(8))):
+            return None
+        if not (len(co) == 8 and all(0 <= x <= 2 for x in co)):
+            return None
+        if not (len(ep) == 12 and set(ep) == set(range(12))):
+            return None
+        if not (len(eo) == 12 and all(0 <= x <= 1 for x in eo)):
+            return None
+        return (cp, co, ep, eo)
     except Exception:
         return None
 
@@ -474,33 +581,31 @@ def _parse_facelets_with_variants(clear: bytes):
 def _is_solved_facelets(clear: bytes) -> bool:
     """Return True if a decrypted packet (with or without 0x55 0x02 header) is solved."""
     try:
-        # Accept packets with GAN header and strip it if present
-        if len(clear) >= 21 and clear[0] == 0x55 and clear[1] == 0x02:
+        # If facelets header present, try headered parse first (matches backend exactly)
+        if len(clear) >= 19 and clear[0] == 0x55 and clear[1] == 0x02:
+            parsed = _parse_facelets_headered(clear)
+            # Also prepare headerless body for fallback
             body = clear[2:]
         else:
+            parsed = None
             body = clear
 
-        # Need at least 19 bytes of facelets data (headerless)
-        if len(body) < 19:
-            return False
-
-        # 1) Try canonical headerless parse first (backend bit layout - 16 bits)
-        parsed = _parse_facelets_canonical(body)
+        # If headered parse failed, try canonical headerless (-16 bit shift)
+        if (not parsed) and (len(body) >= 17):
+            parsed = _parse_facelets_canonical(body)
         if parsed:
             cp, co, ep, eo = parsed
         else:
             # 2) Fallback to variant search
-            cp, co, ep, eo, _ = _parse_facelets_with_variants(body)
+            cp, co, ep, eo, _ = _parse_facelets_with_variants(body if len(body) >= 17 else clear)
             if not cp:
                 return False
 
-        # A solved cube has all permutations and orientations in order (0..N-1 and all 0s)
-        is_cp_solved = (cp == list(range(8)))
-        is_co_solved = (co == [0] * 8)
-        is_ep_solved = (ep == list(range(12)))
-        is_eo_solved = (eo == [0] * 12)
-
-        return is_cp_solved and is_co_solved and is_ep_solved and is_eo_solved
+        # Convert to facelets string and compare against canonical solved
+        facelets = _to_kociemba_facelets(cp, co, ep, eo)
+        if not facelets:
+            return False
+        return facelets == _SOLVED_FACELETS
 
     except Exception as e:
         try:
@@ -512,11 +617,17 @@ def _is_solved_facelets(clear: bytes) -> bool:
 def _debug_facelets(clear: bytes):
     """Debug helper: print CP/CO/EP/EO arrays from compressed bit fields."""
     try:
-        if len(clear) < 19:
+        # Accept packets with GAN header and strip it if present
+        if len(clear) >= 21 and clear[0] == 0x55 and clear[1] == 0x02:
+            body = clear[2:]
+        else:
+            body = clear
+
+        if len(body) < 19:
             return
 
         # Default parse (for comparison; backend positions with no shift)
-        bits_default = _bits_from_bytes(clear)
+        bits_default = _bits_from_bytes(body)
         cp_d = []
         co_d = []
         ep_d = []
@@ -533,14 +644,14 @@ def _debug_facelets(clear: bytes):
         eo_d.append((2 - (sum(eo_d) % 2)) % 2)
 
         # Canonical headerless parse (preferred)
-        parsed_canon = _parse_facelets_canonical(clear)
+        parsed_canon = _parse_facelets_canonical(body)
         if parsed_canon:
             cp_c, co_c, ep_c, eo_c = parsed_canon
         else:
             cp_c = co_c = ep_c = eo_c = None
 
         # Variant search parse (validated)
-        cp, co, ep, eo, label = _parse_facelets_with_variants(clear)
+        cp, co, ep, eo, label = _parse_facelets_with_variants(body)
 
         # Validity checks
         valid_cp = bool(cp and set(cp) == set(range(8)))
@@ -549,7 +660,7 @@ def _debug_facelets(clear: bytes):
         valid_eo = bool(eo and all(0 <= x <= 1 for x in eo))
 
         print("--- FACELETS DEBUG ---")
-        print("CLR:", len(clear), ":", _hex(clear))
+        print("CLR:", len(body), ":", _hex(body))
         print("Default CP:", cp_d)
         print("Default CO:", co_d)
         print("Default EP:", ep_d)
@@ -652,8 +763,13 @@ def _send_command_payload(payload: bytes) -> bool:
         if not enc:
             print("! Encrypt failed or invalid length")
             return False
-        # mode=1: write without response
-        ble.gattc_write(_conn, _cmd_handle, enc, 1)
+        # Prefer write-with-response for reliability on some stacks
+        try:
+            ble.gattc_write(_conn, _cmd_handle, enc, 0)
+        except Exception as e2:
+            # Fallback to write-without-response
+            print("! gattc_write w/resp err, fallback to WNR:", e2)
+            ble.gattc_write(_conn, _cmd_handle, enc, 1)
         if _DBG_PACKETS:
             try:
                 print("TX ENC", len(enc), ":", _hex(enc))
@@ -741,64 +857,56 @@ def _enable_notify(conn_handle, value_handle):
     # Write 0x0001 to CCCD (value_handle + 1) to enable notifications.
     # mode=1 (write-without-response) is fine for CCCD on most stacks.
     try:
-        ble.gattc_write(conn_handle, value_handle + 1, b"\x01\x00", 1)
-        print("  CCCD enabled @", value_handle + 1)
-        # Backoff slightly after a write to avoid overlapping next GATT op
+        # Prefer write-with-response for CCCD reliability; enable both notify+indicate
         try:
-            now_ms = time.ticks_ms()
-            globals()['_ble_next_ok_ms'] = time.ticks_add(now_ms, 80)
+            ble.gattc_write(conn_handle, value_handle + 1, b"\x03\x00", 0)
         except Exception:
-            globals()['_ble_next_ok_ms'] = (globals().get('_ble_next_ok_ms') or 0) + 80
+            ble.gattc_write(conn_handle, value_handle + 1, b"\x03\x00", 1)
+        print("  CCCD enabled @", value_handle + 1)
     except Exception as e:
         print("  CCCD write failed:", e)
 
 def _start_next_char_discovery():
-    """Pop next service range and start characteristic discovery (one at a time).
-
-    Called from the main loop to avoid kicking off new GATT ops inside the IRQ
-    handler, which can trigger EALREADY on some ports.
-    """
-    global _char_queue, _char_discover_in_progress, _ble_next_ok_ms
-    if not _char_queue or _conn is None or _char_discover_in_progress:
+    """Pop next service range and start characteristic discovery (one at a time)."""
+    global _char_queue
+    if not _char_queue or _conn is None:
         return
-    # Respect a small backoff between ops
+    item = _char_queue.pop(0)
+    if isinstance(item, tuple) and len(item) >= 2:
+        start = item[0]
+        end = item[1]
+    else:
+        start, end = item
     try:
-        if time.ticks_diff(time.ticks_ms(), _ble_next_ok_ms) < 0:
-            return
+        print("  Discovering chars:", start, "-", end)
     except Exception:
         pass
-    start, end = _char_queue.pop(0)
     try:
         ble.gattc_discover_characteristics(_conn, start, end)
-        _char_discover_in_progress = True
-        try:
-            _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 80)
-        except Exception:
-            _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 80
     except Exception as e:
-        # If EALREADY ever appears, back off and retry later from main loop
+        # If EALREADY ever appears, wait a tick and retry once
+        print("  char discover err:", e)
+        time.sleep_ms(50)
         try:
-            print("  char discover err:", e)
-        except Exception:
-            pass
-        try:
-            _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 100)
-        except Exception:
-            _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 100
-        # Push range back for a later retry
-        _char_queue.insert(0, (start, end))
+            ble.gattc_discover_characteristics(_conn, start, end)
+        except Exception as e2:
+            print("  char discover retry failed:", e2)
 
 def _on_notify(conn_handle, value_handle, data):
     # Decrypt each notification payload directly (supports 16–20+ byte frames)
-    global _alarm_on, _pkt_dbg_next_ms
+    global _alarm_on, _pkt_dbg_next_ms, _last_solved
     if conn_handle != _conn:
         return
     if not _key or not _iv:
         return
-    # If we know the state characteristic, ignore other notifies
-    if (_state_handle is not None) and (value_handle != _state_handle):
-        return
+    # Prefer state handle, but accept packets from other notify/indicate handles too
     chunk = bytes(data)
+    try:
+        print("Notify vh=", value_handle, "len=", len(chunk))
+        if _DBG_PACKETS:
+            print("RAW", len(chunk), ":", _hex(chunk))
+    except Exception:
+        pass
     if len(chunk) < 16:
         print("! short notify", len(chunk))
         return
@@ -810,36 +918,43 @@ def _on_notify(conn_handle, value_handle, data):
     if clear is None:
         print("! decrypt returned None for len", len(chunk))
         return
-    # Good frames usually start with 0x55
+    # Packet debug (throttled)
     if _DBG_PACKETS:
         try:
             now_ms = time.ticks_ms()
             if time.ticks_diff(now_ms, _pkt_dbg_next_ms) >= 0:
                 print("CLR", len(clear), ":", _hex(clear))
+                print("Type:", _analyze_packet_type(clear))
                 try:
                     _pkt_dbg_next_ms = time.ticks_add(now_ms, 250)
                 except Exception:
                     _pkt_dbg_next_ms = now_ms + 250
         except Exception:
             pass
-    # Update simple UI based on packet type - match backend logic
-    if len(clear) >= 19 and clear[0] == 0x55 and clear[1] == 0x02:
-        # Facelets packet (state update)
-        if _DBG_FACELETS:
-            _debug_facelets(clear)
 
-        solved = _is_solved_facelets(clear)
-        if solved:
-            print("✅ Cube solved")
-            _ui_text("Connected", "Solved!")
-            # Stop alarm when solved
-            if _alarm_on and _audio:
-                try:
-                    _audio.stop()
-                except Exception:
-                    pass
-                _alarm_on = False
-    elif len(clear) >= 16 and clear[0] == 0x55:
+    # Try solved detection on any plausible frame (handles headered and headerless)
+    if len(clear) >= 17:
+        try:
+            solved = _is_solved_facelets(clear)
+            if (_last_solved is None) or (solved != _last_solved):
+                _last_solved = solved
+                if solved:
+                    print("✅ Cube solved")
+                    _ui_text("Connected", "Solved!")
+                    if _alarm_on and _audio:
+                        try:
+                            _audio.stop()
+                        except Exception:
+                            pass
+                        _alarm_on = False
+                else:
+                    print("Cube not solved")
+                    _ui_text("Connected", "Not solved")
+        except Exception:
+            pass
+
+    # Move events (use headered types if present) and trigger facelets
+    if len(clear) >= 16 and clear[0] == 0x55:
         # 16-byte packets could be moves or other events
         if clear[1] == 0x02 and len(clear) == 16:
             # 16B 0x02 move-variant
@@ -850,16 +965,28 @@ def _on_notify(conn_handle, value_handle, data):
                 except Exception:
                     pass
             _ui_text("Connected", "Move…")
-            _schedule_facelets_poll(80)
+            _schedule_facelets_poll(150)
         elif clear[1] == 0x01:
             # Standard move packet
             _ui_text("Connected", "Move…")
-            _schedule_facelets_poll(80)
+            _schedule_facelets_poll(150)
+    # Track facelets serial and timestamp for periodic polling
+    if len(clear) >= 19 and clear[0] == 0x55 and clear[1] == 0x02:
+        try:
+            serial = int.from_bytes(clear[2:4], 'little')
+            if serial != _last_facelets_serial:
+                _last_facelets_serial = serial
+            _last_facelets_ms = time.ticks_ms()
+        except Exception:
+            pass
 
 # --- IRQ ---------------------------------------------------------------------
 
 def _irq(event, data):
     global _conn, _svc_ranges, _char_queue, _notify_handles, _key, _iv, _connecting, _audio, _alarm_on, _cmd_handle, _state_handle, _did_send_initial_facelets, _rx_buf, _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms, _scan_dbg_next_ms
+    global _char_discover_in_progress, _char_discover_start_ms, _char_discover_item
+    global _service_discover_in_progress, _service_discover_start_ms, _service_discover_pending
+    global _ble_next_ok_ms
 
     # Scan results
     if _is_scan_result_event(event, data):
@@ -938,7 +1065,7 @@ def _irq(event, data):
                 _ui_text("Connected", "Alarm!")
         except Exception as e:
             print("Audio start failed:", e)
-        # Begin service discovery
+        # Begin service discovery immediately to prevent disconnect
         _svc_ranges = []
         _char_queue = []
         _notify_handles = []
@@ -1000,6 +1127,7 @@ def _irq(event, data):
             # queue all discovered service ranges and kick off first char discovery
             _char_queue = list(_svc_ranges)
             print("Services:", len(_char_queue), "ranges")
+            _start_next_char_discovery()
             # Defer starting discovery to the main loop to avoid EALREADY inside IRQ
             try:
                 _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 50)
@@ -1014,44 +1142,64 @@ def _irq(event, data):
             try:
                 if uuid == STATE_UUID:
                     _state_handle = value_handle
-                    if properties & FLAG_NOTIFY:
+                    if properties & (FLAG_NOTIFY | FLAG_INDICATE):
                         _notify_handles.append(value_handle)
                     print("  STATE char @", value_handle)
                 elif uuid == CMD_UUID:
                     _cmd_handle = value_handle
                     print("  CMD   char @", value_handle)
                 else:
-                    # Fallback: enable notify for any other NOTIFY chars too
-                    if properties & FLAG_NOTIFY:
+                    # Fallback: enable notify/indicate for any other chars too
+                    if properties & (FLAG_NOTIFY | FLAG_INDICATE):
                         _notify_handles.append(value_handle)
-                        print("  NOTIFY char @", value_handle)
+                        print("  NOTIFY/INDICATE char @", value_handle)
+                # If we have both handles and haven't requested facelets yet, schedule it
+                if (_cmd_handle is not None) and (_state_handle is not None) and (not _did_send_initial_facelets):
+                    globals()['_initial_facelets_pending'] = True
             except Exception as e:
-                # On some ports, uuid equality can be finicky; still enable notifies
-                if properties & FLAG_NOTIFY:
+                # On some ports, uuid equality can be finicky; still enable notifies/indicates
+                if properties & (FLAG_NOTIFY | FLAG_INDICATE):
                     _notify_handles.append(value_handle)
-                    print("  NOTIFY char @", value_handle, "(uuid cmp err)", e)
+                    print("  NOTIFY/INDICATE char @", value_handle, "(uuid cmp err)", e)
 
     elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
         conn_handle, status = data
         if conn_handle == _conn:
-            # Mark end of this discovery range; main loop will enable CCCDs
-            # and start the next range with a small backoff to avoid EALREADY.
-            _char_discover_in_progress = False
-            try:
-                _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 50)
-            except Exception:
-                _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 50
+            # After finishing one range, enable any pending CCCDs first
+            while _notify_handles:
+                vh = _notify_handles.pop(0)
+                _enable_notify(_conn, vh)
+
+            # If we've already found both CMD and STATE, stop further discovery to avoid EALREADY
+            if (_cmd_handle is not None) and (_state_handle is not None):
+                _char_queue = []
+                try:
+                    print("Discovery complete (CMD+STATE found)")
+                except Exception:
+                    pass
+            else:
+                # Continue to next range only if still needed
+                _start_next_char_discovery()
             # If discovery finished and we have a CMD handle, request facelets once
             if not _char_queue and (_cmd_handle is not None) and (not _did_send_initial_facelets):
                 _did_send_initial_facelets = True
                 # Defer write outside IRQ to avoid EALREADY
-                _schedule_facelets_poll(80)
+                _schedule_facelets_poll(150)
                 print("Initial facelets scheduled")
+                # Ensure at least a couple retries if first request is missed
+                try:
+                    if _facelets_retry_count < 2:
+                        _facelets_retry_count = 2
+                except Exception:
+                    pass
 
     # Notifications (forward to handler)
     elif event == _IRQ_GATTC_NOTIFY:
         conn_handle, value_handle, notify_data = data
         _on_notify(conn_handle, value_handle, notify_data)
+    elif event == _IRQ_GATTC_INDICATE:
+        conn_handle, value_handle, indicate_data = data
+        _on_notify(conn_handle, value_handle, indicate_data)
 
 # --- Run ---------------------------------------------------------------------
 
