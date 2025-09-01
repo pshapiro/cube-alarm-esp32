@@ -19,6 +19,7 @@ SCAN_MS     = const(10000)  # 10 s active scan
 KNOWN_MAC   = "CF:AA:79:C9:96:9C"  # <- your cube's public MAC (normal big‑endian)
 DEBUG_SCAN  = const(0)
 DEBUG_SCAN_RATE_MS = const(200)  # throttle when DEBUG_SCAN is enabled
+BTN_LONG_MS = const(1200)  # long-press threshold for manual alarm stop
 
 # GAN Gen3 UUIDs
 SERVICE_UUID = bluetooth.UUID('8653000a-43e6-47b7-9cb0-5fc21d4ae340')
@@ -51,6 +52,9 @@ _rx_buf = b""
 _svc_ranges = []      # [(start, end)]
 _char_queue = []      # [(start, end)] yet to process
 _notify_handles = []  # value handles with NOTIFY
+_notify_queue = []     # queued (conn, vh, bytes) notifications to process in main loop
+_notify_drop_count = 0
+_cccd_queue = []       # value handles whose CCCD needs enabling (processed in main loop)
 _conn = None
 _connecting = False
 _audio = None
@@ -61,13 +65,17 @@ _char_discover_item = None          # legacy var, not used in reverted flow
 _service_discover_in_progress = False
 _service_discover_start_ms = 0
 _service_discover_pending = False
+_discovery_complete_pending = False
 _ble_next_ok_ms = 0
 _initial_facelets_pending = False
+_state_cccd_enabled = False
+_initial_facelets_deadline_ms = 0
 
 # GAN characteristic handles
 _cmd_handle = None
 _state_handle = None
 _did_send_initial_facelets = False
+_first_facelets_wr_mode0 = False
 
 # Deferred command retry (handled in UI loop, not inside BLE IRQ)
 _facelets_retry_count = 0
@@ -86,6 +94,7 @@ _pkt_dbg_next_ms = 0
 _last_solved = None
 _last_facelets_serial = -1
 _last_facelets_ms = 0
+_last_write_ealready = False
 
 # Facelets mapping (URFDLB order) for optional facelets string output
 _FACES_ORDER = "URFDLB"
@@ -148,6 +157,7 @@ _btn_a_last = 1
 _btn_b_last = 1
 _btn_a_next_ok_ms = 0
 _btn_b_next_ok_ms = 0
+_btn_b_press_ms = 0
 
 def _ui_text(line1="", line2=""):
     # Only mark desired UI state; actual drawing happens in background thread
@@ -176,7 +186,7 @@ def _ui_draw(now_tuple=None):
         print("OLED draw err:", e)
 
 def _ui_loop():
-    global _ui_dirty, _ui_thread_running, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _facelets_retry_count, _facelets_retry_next_ms
+    global _ui_dirty, _ui_thread_running, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _facelets_retry_count, _facelets_retry_next_ms, _alarm_on, _btn_b_press_ms, _last_write_ealready
     last_sec = -1
     while _ui_thread_running:
         try:
@@ -197,9 +207,28 @@ def _ui_loop():
                 _btn_a_last = a
             if _btn_b is not None:
                 b = _btn_b.value()
-                if _btn_b_last == 1 and b == 0 and time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
-                    send_request_reset()
-                    _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
+                if _btn_b_last == 1 and b == 0:
+                    _btn_b_press_ms = now_ms
+                elif _btn_b_last == 0 and b == 1:
+                    dur = time.ticks_diff(now_ms, _btn_b_press_ms) if _btn_b_press_ms else 0
+                    if dur >= BTN_LONG_MS:
+                        # Long press: stop alarm
+                        if _alarm_on and _audio:
+                            try:
+                                _audio.stop()
+                            except Exception:
+                                pass
+                            _alarm_on = False
+                            _ui_text("Alarm off", "")
+                    else:
+                        # Short press: reset cube
+                        if time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
+                            send_request_reset()
+                            try:
+                                _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
+                            except Exception:
+                                _btn_b_next_ok_ms = now_ms + 200
+                    _btn_b_press_ms = 0
                 _btn_b_last = b
 
             # 3) Service audio alarm in polled mode
@@ -212,12 +241,20 @@ def _ui_loop():
             if (_conn is not None) and (_cmd_handle is not None) and (_facelets_retry_count > 0):
                 if time.ticks_diff(now_ms, _facelets_retry_next_ms) >= 0:
                     ok = send_request_facelets()
-                    _facelets_retry_count -= 1
-                    _facelets_retry_next_ms = time.ticks_add(now_ms, 200)
+                    delay = 200
+                    try:
+                        if (not ok) and _last_write_ealready:
+                            delay = 60
+                        else:
+                            _facelets_retry_count -= 1
+                    except Exception:
+                        _facelets_retry_count -= 1
+                    _facelets_retry_next_ms = time.ticks_add(now_ms, delay)
                     try:
                         print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
                     except Exception:
                         pass
+                    _last_write_ealready = False
         except Exception:
             pass
         # Tight-ish loop to keep audio fed and buttons responsive
@@ -236,7 +273,7 @@ def _ui_init():
     print("UI: Skipping thread to avoid core1 conflicts")
 
 def _buttons_init():
-    global _btn_a, _btn_b, _btn_a_last, _btn_b_last, _buttons_thread_running, _btn_a_next_ok_ms, _btn_b_next_ok_ms
+    global _btn_a, _btn_b, _btn_a_last, _btn_b_last, _buttons_thread_running, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _btn_b_press_ms
     try:
         _btn_a = Pin(14, Pin.IN, Pin.PULL_UP)
         _btn_b = Pin(15, Pin.IN, Pin.PULL_UP)
@@ -245,6 +282,7 @@ def _buttons_init():
         t0 = time.ticks_ms()
         _btn_a_next_ok_ms = t0
         _btn_b_next_ok_ms = t0
+        _btn_b_press_ms = 0
         # No separate button thread; buttons are polled in _ui_loop to avoid core1 contention
     except Exception as e:
         print("Buttons init failed:", e)
@@ -273,8 +311,11 @@ def _buttons_loop():
 
 def _poll_tick():
     """Single cooperative tick: UI draw, buttons, audio, and deferred facelets writes."""
-    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms
-    global _facelets_retry_count, _facelets_retry_next_ms
+    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _alarm_on, _btn_b_press_ms, _notify_queue
+    global _facelets_retry_count, _facelets_retry_next_ms, _last_write_ealready
+    global _cccd_queue, _initial_facelets_pending, _did_send_initial_facelets, _cmd_handle, _state_handle, _discovery_complete_pending, _state_cccd_enabled, _initial_facelets_deadline_ms
+    global _first_facelets_wr_mode0
+    global _ble_next_ok_ms
     try:
         # UI draw once per second or when marked dirty
         now = time.localtime()
@@ -293,9 +334,28 @@ def _poll_tick():
             _btn_a_last = a
         if _btn_b is not None:
             b = _btn_b.value()
-            if _btn_b_last == 1 and b == 0 and time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
-                send_request_reset()
-                _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
+            if _btn_b_last == 1 and b == 0:
+                _btn_b_press_ms = now_ms
+            elif _btn_b_last == 0 and b == 1:
+                dur = time.ticks_diff(now_ms, _btn_b_press_ms) if _btn_b_press_ms else 0
+                if dur >= BTN_LONG_MS:
+                    # Long press: stop alarm
+                    if _alarm_on and _audio:
+                        try:
+                            _audio.stop()
+                        except Exception:
+                            pass
+                        _alarm_on = False
+                        _ui_text("Alarm off", "")
+                else:
+                    # Short press: reset cube
+                    if time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
+                        send_request_reset()
+                        try:
+                            _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
+                        except Exception:
+                            _btn_b_next_ok_ms = now_ms + 200
+                _btn_b_press_ms = 0
             _btn_b_last = b
 
         # Service audio alarm
@@ -305,24 +365,134 @@ def _poll_tick():
             except Exception:
                 pass
 
+        # Print discovery-complete message from main loop to avoid IRQ prints
+        if _discovery_complete_pending:
+            try:
+                print("Discovery complete (CMD+STATE found)")
+            except Exception:
+                pass
+            _discovery_complete_pending = False
+
+        # Enable up to 2 CCCDs per tick in main loop (respect BLE cooldown)
+        # If initial facelets has been scheduled but not yet sent/succeeded, pause CCCD enabling
+        cccd_processed = 0
+        while _cccd_queue and cccd_processed < 2 and (_conn is not None):
+            try:
+                if _did_send_initial_facelets and (_facelets_retry_count > 0):
+                    break
+            except Exception:
+                pass
+            # Don't issue a CCCD write if we're still in the cooldown window
+            try:
+                if _ble_next_ok_ms and time.ticks_diff(now_ms, _ble_next_ok_ms) < 0:
+                    break
+            except Exception:
+                pass
+            try:
+                vh = _cccd_queue.pop(0)
+                _enable_notify(_conn, vh)
+                if (_state_handle is not None) and (vh == _state_handle):
+                    _state_cccd_enabled = True
+            except Exception:
+                pass
+            cccd_processed += 1
+
+        # Schedule initial facelets once, outside IRQ, after STATE CCCD is enabled (or after timeout)
+        if _initial_facelets_pending and (_cmd_handle is not None) and (_state_handle is not None) and (not _did_send_initial_facelets):
+            # Start a deadline if not set
+            if _initial_facelets_deadline_ms == 0:
+                try:
+                    _initial_facelets_deadline_ms = time.ticks_add(now_ms, 1500)
+                except Exception:
+                    _initial_facelets_deadline_ms = now_ms + 1500
+            # Proceed when CCCD enabled or deadline passed
+            should_schedule = _state_cccd_enabled
+            try:
+                if not should_schedule and (_initial_facelets_deadline_ms != 0):
+                    should_schedule = time.ticks_diff(now_ms, _initial_facelets_deadline_ms) >= 0
+            except Exception:
+                pass
+            if should_schedule:
+                _did_send_initial_facelets = True
+                _initial_facelets_pending = False
+                _initial_facelets_deadline_ms = 0
+                # Ensure at least a couple retries
+                try:
+                    if _facelets_retry_count < 2:
+                        _facelets_retry_count = 2
+                except Exception:
+                    pass
+                # Force the very first facelets to use write-with-response once
+                _first_facelets_wr_mode0 = True
+                # Schedule immediately (actual target respects BLE cooldown)
+                _schedule_facelets_poll(0)
+                # Debug: show target/now/cooldown to investigate pauses
+                try:
+                    print("Initial facelets target:", _facelets_retry_next_ms, "now:", now_ms, "cooldown until:", _ble_next_ok_ms)
+                except Exception:
+                    pass
+                try:
+                    print("Initial facelets scheduled")
+                except Exception:
+                    pass
+
+        # Drain a few queued notifications without starving audio
+        if _notify_queue:
+            try:
+                start_ms = time.ticks_ms()
+            except Exception:
+                start_ms = 0
+            processed = 0
+            while _notify_queue and processed < 3:
+                try:
+                    conn_handle, value_handle, chunk = _notify_queue.pop(0)
+                    _on_notify(conn_handle, value_handle, chunk)
+                except Exception:
+                    pass
+                processed += 1
+                try:
+                    if start_ms and time.ticks_diff(time.ticks_ms(), start_ms) > 4:
+                        break
+                except Exception:
+                    pass
+
         # Process deferred facelets write retries scheduled from IRQ
         if (_conn is not None) and (_cmd_handle is not None) and (_facelets_retry_count > 0):
             if time.ticks_diff(now_ms, _facelets_retry_next_ms) >= 0:
-                ok = send_request_facelets()
-                _facelets_retry_count -= 1
+                # Respect BLE cooldown before attempting a write
+                cooldown = False
                 try:
-                    _facelets_retry_next_ms = time.ticks_add(now_ms, 200)
-                except Exception:
-                    _facelets_retry_next_ms = now_ms + 200
-                try:
-                    print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
+                    if _ble_next_ok_ms and time.ticks_diff(now_ms, _ble_next_ok_ms) < 0:
+                        try:
+                            print("Cooldown wait:", now_ms, "->", _ble_next_ok_ms)
+                        except Exception:
+                            pass
+                        _facelets_retry_next_ms = _ble_next_ok_ms
+                        cooldown = True
                 except Exception:
                     pass
+                if not cooldown:
+                    ok = send_request_facelets()
+                    delay = 200
+                    try:
+                        if (not ok) and _last_write_ealready:
+                            delay = 40
+                        else:
+                            _facelets_retry_count -= 1
+                    except Exception:
+                        _facelets_retry_count -= 1
+                    _facelets_retry_next_ms = time.ticks_add(now_ms, delay)
+                    try:
+                        print("Facelets retry ->", ok, "remaining", _facelets_retry_count)
+                    except Exception:
+                        pass
+                    _last_write_ealready = False
         # If we haven't seen a new facelets in a while, proactively poll once
         try:
             if (_conn is not None) and (_cmd_handle is not None):
                 if (_last_facelets_ms == 0) or (time.ticks_diff(now_ms, _last_facelets_ms) > 1200):
-                    send_request_facelets()
+                    # Defer via scheduler (respects BLE cooldown and rate limit)
+                    _schedule_facelets_poll(0)
                     # avoid spamming; wait at least 800ms before next proactive poll
                     try:
                         _last_facelets_ms = time.ticks_add(now_ms, 800)
@@ -450,7 +620,7 @@ def _parse_facelets_canonical(clear: bytes):
 
     Uses backend bit positions with a -16 bit shift (header removed):
       CP start=24, CO start=45, EP start=61, EO start=105 (relative to headered).
-    Returns (cp, co, ep, eo) if valid, else None.
+    Returns (cp, co, ep, eo) if valid; otherwise returns None.
     """
     try:
         # 17 bytes of headerless data is sufficient
@@ -749,27 +919,38 @@ def _norm(s: str) -> str:
 
 # --- Command send helpers ----------------------------------------------------
 
-def _send_command_payload(payload: bytes) -> bool:
+def _send_command_payload(payload: bytes, mode: int = 1) -> bool:
     """Encrypt and write a 16/32B payload to the command characteristic."""
-    global _conn, _cmd_handle
+    global _conn, _cmd_handle, _last_write_ealready
     if _conn is None or _cmd_handle is None:
         print("! Cannot send: no connection/cmd handle")
         return False
-    if not _key or not _iv:
-        print("! Cannot send: keys not ready")
-        return False
     try:
-        enc = encrypt_packet(payload, _key, _iv)
-        if not enc:
-            print("! Encrypt failed or invalid length")
-            return False
-        # Prefer write-with-response for reliability on some stacks
+        key = _key
+        iv = _iv
+        enc = encrypt_packet(payload, key, iv)
+        if _DBG_PACKETS:
+            try:
+                print("TX cmd (mode=", mode, ") len=", len(payload))
+            except Exception:
+                pass
         try:
-            ble.gattc_write(_conn, _cmd_handle, enc, 0)
-        except Exception as e2:
-            # Fallback to write-without-response
-            print("! gattc_write w/resp err, fallback to WNR:", e2)
-            ble.gattc_write(_conn, _cmd_handle, enc, 1)
+            ble.gattc_write(_conn, _cmd_handle, enc, mode)
+        except Exception as e:
+            # Detect EALREADY to apply shorter backoff without consuming a retry
+            try:
+                en = getattr(e, 'errno', None)
+                if (en is None) and hasattr(e, 'args') and e.args:
+                    en = e.args[0]
+            except Exception:
+                en = None
+            try:
+                if (en == 114) or ("EALREADY" in str(e)):
+                    _last_write_ealready = True
+            except Exception:
+                pass
+            print("! gattc_write noresp err:", e)
+            return False
         if _DBG_PACKETS:
             try:
                 print("TX ENC", len(enc), ":", _hex(enc))
@@ -785,7 +966,7 @@ def _schedule_facelets_poll(delay_ms=50):
 
     Avoids writing inside IRQ by deferring to the UI loop via existing retry mechanism.
     """
-    global _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms
+    global _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms, _ble_next_ok_ms
     try:
         now_ms = time.ticks_ms()
         # Rate limit
@@ -794,12 +975,23 @@ def _schedule_facelets_poll(delay_ms=50):
         # Ensure at least one retry is queued
         if _facelets_retry_count <= 0:
             _facelets_retry_count = 1
-        # Schedule for near future
+        # Schedule for near future, but not before BLE cooldown window
+        try:
+            target = time.ticks_add(now_ms, delay_ms)
+        except Exception:
+            target = now_ms + delay_ms
+        try:
+            if _ble_next_ok_ms:
+                # if _ble_next_ok_ms is later than target, use it
+                if time.ticks_diff(_ble_next_ok_ms, target) > 0:
+                    target = _ble_next_ok_ms
+        except Exception:
+            pass
         try:
             if (_facelets_retry_next_ms == 0) or (time.ticks_diff(_facelets_retry_next_ms, now_ms) < 0):
-                _facelets_retry_next_ms = time.ticks_add(now_ms, delay_ms)
+                _facelets_retry_next_ms = target
         except Exception:
-            _facelets_retry_next_ms = now_ms + delay_ms
+            _facelets_retry_next_ms = target
         # Next allowed poll time
         try:
             _facelets_rate_next_ms = time.ticks_add(now_ms, 250)
@@ -815,10 +1007,21 @@ def _schedule_facelets_poll(delay_ms=50):
 
 def send_request_facelets() -> bool:
     """Send REQUEST_FACELETS (0x02) command (16 bytes)."""
+    global _first_facelets_wr_mode0
     payload = bytes([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
     _ui_text("Connected", "Cmd:Face")
-    return _send_command_payload(payload)
+    try:
+        if _first_facelets_wr_mode0:
+            print("send_request_facelets() [mode=0 first]")
+        else:
+            print("send_request_facelets()")
+    except Exception:
+        pass
+    if _first_facelets_wr_mode0:
+        _first_facelets_wr_mode0 = False
+        return _send_command_payload(payload, mode=0)
+    return _send_command_payload(payload, mode=1)
 
 def send_request_reset() -> bool:
     """Send REQUEST_RESET command (16 bytes)."""
@@ -854,17 +1057,22 @@ def _is_scan_result_event(event, data) -> bool:
     return False
 
 def _enable_notify(conn_handle, value_handle):
-    # Write 0x0001 to CCCD (value_handle + 1) to enable notifications.
-    # mode=1 (write-without-response) is fine for CCCD on most stacks.
+    # Write 0x0003 (notify+indicate) to CCCD (value_handle + 1) using write-without-response.
+    # After writing, set a short BLE cooldown window to avoid immediate EALREADY on next op.
+    global _ble_next_ok_ms
     try:
-        # Prefer write-with-response for CCCD reliability; enable both notify+indicate
+        ble.gattc_write(conn_handle, value_handle + 1, b"\x03\x00", 1)
         try:
-            ble.gattc_write(conn_handle, value_handle + 1, b"\x03\x00", 0)
+            print("  CCCD enabled @", value_handle + 1)
         except Exception:
-            ble.gattc_write(conn_handle, value_handle + 1, b"\x03\x00", 1)
-        print("  CCCD enabled @", value_handle + 1)
+            pass
     except Exception as e:
         print("  CCCD write failed:", e)
+    # Regardless of result, push next BLE op a bit into the future
+    try:
+        _ble_next_ok_ms = time.ticks_add(time.ticks_ms(), 60)
+    except Exception:
+        _ble_next_ok_ms = (globals().get('_ble_next_ok_ms') or 0) + 60
 
 def _start_next_char_discovery():
     """Pop next service range and start characteristic discovery (one at a time)."""
@@ -884,13 +1092,12 @@ def _start_next_char_discovery():
     try:
         ble.gattc_discover_characteristics(_conn, start, end)
     except Exception as e:
-        # If EALREADY ever appears, wait a tick and retry once
+        # If EALREADY or similar appears, let main loop retry by pushing this range back.
         print("  char discover err:", e)
-        time.sleep_ms(50)
         try:
-            ble.gattc_discover_characteristics(_conn, start, end)
-        except Exception as e2:
-            print("  char discover retry failed:", e2)
+            _char_queue.insert(0, (start, end))
+        except Exception:
+            pass
 
 def _on_notify(conn_handle, value_handle, data):
     # Decrypt each notification payload directly (supports 16–20+ byte frames)
@@ -901,12 +1108,18 @@ def _on_notify(conn_handle, value_handle, data):
         return
     # Prefer state handle, but accept packets from other notify/indicate handles too
     chunk = bytes(data)
-    try:
-        print("Notify vh=", value_handle, "len=", len(chunk))
-        if _DBG_PACKETS:
-            print("RAW", len(chunk), ":", _hex(chunk))
-    except Exception:
-        pass
+    if _DBG_PACKETS:
+        try:
+            now_ms = time.ticks_ms()
+            if time.ticks_diff(now_ms, _pkt_dbg_next_ms) >= 0:
+                print("Notify vh=", value_handle, "len=", len(chunk))
+                print("RAW", len(chunk), ":", _hex(chunk))
+                try:
+                    _pkt_dbg_next_ms = time.ticks_add(now_ms, 250)
+                except Exception:
+                    _pkt_dbg_next_ms = now_ms + 250
+        except Exception:
+            pass
     if len(chunk) < 16:
         print("! short notify", len(chunk))
         return
@@ -986,7 +1199,8 @@ def _irq(event, data):
     global _conn, _svc_ranges, _char_queue, _notify_handles, _key, _iv, _connecting, _audio, _alarm_on, _cmd_handle, _state_handle, _did_send_initial_facelets, _rx_buf, _facelets_retry_count, _facelets_retry_next_ms, _facelets_rate_next_ms, _scan_dbg_next_ms
     global _char_discover_in_progress, _char_discover_start_ms, _char_discover_item
     global _service_discover_in_progress, _service_discover_start_ms, _service_discover_pending
-    global _ble_next_ok_ms
+    global _ble_next_ok_ms, _notify_queue, _notify_drop_count, _cccd_queue, _discovery_complete_pending
+    global _state_cccd_enabled, _initial_facelets_deadline_ms
 
     # Scan results
     if _is_scan_result_event(event, data):
@@ -1035,51 +1249,41 @@ def _irq(event, data):
     # Connection events
     elif event == _IRQ_PERIPHERAL_CONNECT:
         conn_handle, addr_type, addr = data
-        _conn = conn_handle
-        _connecting = False
-        mac = _mac_norm_from_le(addr)
-        print("Connected:", mac, "handle", conn_handle)
-        try:
-            _key, _iv = derive_key_iv_from_mac(mac)
-            print("Key/IV ready.")
-            if _DBG_FACELETS:
-                try:
-                    print("Key[:6] =", _hex(_key[:6]), "IV[:6] =", _hex(_iv[:6]))
-                except Exception:
-                    pass
-        except Exception as e:
-            print("Key derivation failed:", e)
-            return
-        _ui_text("Connected", "Listening…")
-        # Reset discovery/command flags on fresh connection
-        _did_send_initial_facelets = False
-        _cmd_handle = None
-        _state_handle = None
-        # Start alarm tone upon connection
-        try:
-            if _audio is None:
-                _audio = AudioAlarm(10, 11, 9)
-            if _audio and getattr(_audio, 'ok', False) and not _alarm_on:
-                _audio.start()
-                _alarm_on = True
-                _ui_text("Connected", "Alarm!")
-        except Exception as e:
-            print("Audio start failed:", e)
-        # Begin service discovery immediately to prevent disconnect
-        _svc_ranges = []
-        _char_queue = []
-        _notify_handles = []
-        _rx_buf = b""
-        _char_discover_in_progress = False
-        _ble_next_ok_ms = 0
-        # Reset deferred retry state
-        _facelets_retry_count = 0
-        _facelets_retry_next_ms = 0
-        _facelets_rate_next_ms = 0
-        try:
-            ble.gattc_discover_services(_conn)
-        except Exception as e:
-            print("service discovery error:", e)
+        if _conn is None:
+            _conn = conn_handle
+            try:
+                print("Connected:", _mac_norm_from_le(addr))
+            except Exception:
+                print("Connected")
+            _ui_text("Connected", "Listening…")
+            # Reset discovery/command flags on fresh connection
+            _did_send_initial_facelets = False
+            _cmd_handle = None
+            _state_handle = None
+            _state_cccd_enabled = False
+            _initial_facelets_deadline_ms = 0
+            # Begin service discovery immediately to prevent disconnect
+            _svc_ranges = []
+            _char_queue = []
+            _notify_handles = []
+            _rx_buf = b""
+            _char_discover_in_progress = False
+            _ble_next_ok_ms = 0
+            # Reset deferred retry state
+            _facelets_retry_count = 0
+            _facelets_retry_next_ms = 0
+            _facelets_rate_next_ms = 0
+            # Derive encryption keys from peer MAC
+            try:
+                mac_h = _mac_norm_from_le(addr)
+                _key, _iv = derive_key_iv_from_mac(mac_h)
+            except Exception as e:
+                print("Key derivation failed:", e)
+            # Kick off service discovery
+            try:
+                ble.gattc_discover_services(_conn)
+            except Exception as e:
+                print("service discovery error:", e)
 
     elif event == _IRQ_PERIPHERAL_DISCONNECT:
         conn_handle, addr_type, addr = data
@@ -1088,18 +1292,14 @@ def _irq(event, data):
             _conn = None
             _connecting = False
             _ui_text("Disconnected", "")
-            # Ensure alarm is stopped on disconnect
-            if _alarm_on and _audio:
-                try:
-                    _audio.stop()
-                except Exception:
-                    pass
-                _alarm_on = False
+            # Keep alarm sounding on disconnect; user must solve or press button to stop
             # Reset buffers and discovery state
             _rx_buf = b""
             _cmd_handle = None
             _state_handle = None
             _did_send_initial_facelets = False
+            _state_cccd_enabled = False
+            _initial_facelets_deadline_ms = 0
             _svc_ranges = []
             _char_queue = []
             _notify_handles = []
@@ -1165,46 +1365,61 @@ def _irq(event, data):
     elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
         conn_handle, status = data
         if conn_handle == _conn:
-            # After finishing one range, enable any pending CCCDs first
-            while _notify_handles:
-                vh = _notify_handles.pop(0)
-                _enable_notify(_conn, vh)
+            # After finishing one range, queue any pending CCCDs for main-loop enabling
+            if _notify_handles:
+                try:
+                    _cccd_queue.extend(_notify_handles)
+                    _notify_handles = []
+                except Exception:
+                    # Fallback: enable directly if extend fails
+                    while _notify_handles:
+                        vh = _notify_handles.pop(0)
+                        _cccd_queue.append(vh)
 
             # If we've already found both CMD and STATE, stop further discovery to avoid EALREADY
             if (_cmd_handle is not None) and (_state_handle is not None):
                 _char_queue = []
-                try:
-                    print("Discovery complete (CMD+STATE found)")
-                except Exception:
-                    pass
+                _discovery_complete_pending = True
             else:
                 # Continue to next range only if still needed
                 _start_next_char_discovery()
             # If discovery finished and we have a CMD handle, request facelets once
             if not _char_queue and (_cmd_handle is not None) and (not _did_send_initial_facelets):
-                _did_send_initial_facelets = True
-                # Defer write outside IRQ to avoid EALREADY
-                _schedule_facelets_poll(150)
-                print("Initial facelets scheduled")
-                # Ensure at least a couple retries if first request is missed
+                # Mark pending; main loop will schedule and print
+                _initial_facelets_pending = True
+                # Ensure at least a couple retries if first request is missed (handled in main loop scheduling)
                 try:
                     if _facelets_retry_count < 2:
                         _facelets_retry_count = 2
                 except Exception:
                     pass
 
-    # Notifications (forward to handler)
+    # Notifications (enqueue for processing in main loop to avoid IRQ latency)
     elif event == _IRQ_GATTC_NOTIFY:
         conn_handle, value_handle, notify_data = data
-        _on_notify(conn_handle, value_handle, notify_data)
+        try:
+            chunk = bytes(notify_data)
+            if len(_notify_queue) < 16:
+                _notify_queue.append((conn_handle, value_handle, chunk))
+            else:
+                _notify_drop_count += 1
+        except Exception:
+            pass
     elif event == _IRQ_GATTC_INDICATE:
         conn_handle, value_handle, indicate_data = data
-        _on_notify(conn_handle, value_handle, indicate_data)
+        try:
+            chunk = bytes(indicate_data)
+            if len(_notify_queue) < 16:
+                _notify_queue.append((conn_handle, value_handle, chunk))
+            else:
+                _notify_drop_count += 1
+        except Exception:
+            pass
 
 # --- Run ---------------------------------------------------------------------
 
 def run():
-    global ble
+    global ble, _audio, _alarm_on
     print("=== CUBE ALARM STARTING ===")
     try:
         if ble is None:
@@ -1218,6 +1433,16 @@ def run():
     _ui_init()
     _buttons_init()
     ble.irq(_irq)
+    # Start alarm immediately; keep until cube is solved or manually stopped
+    try:
+        if _audio is None:
+            _audio = AudioAlarm(10, 11, 9)
+        if _audio and getattr(_audio, 'ok', False) and not _alarm_on:
+            _audio.start()
+            _alarm_on = True
+            _ui_text("Alarm!", "Twist to wake")
+    except Exception as e:
+        print("Audio start failed:", e)
     # Active scan with wide window (interval=window to be continuously listening)
     # ble.gap_scan(duration_ms, interval_us, window_us, active)
     _ui_text("Scanning...", "Twist to wake")
