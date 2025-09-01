@@ -5,6 +5,7 @@
 import math
 import time
 import _thread
+import array
 
 try:
     from machine import I2S, Pin
@@ -13,12 +14,25 @@ except ImportError:  # In case this port lacks I2S
     Pin = None
 
 class AudioAlarm:
-    def __init__(self, bclk=10, lrclk=11, din=9, rate=22050, tone_hz=880):
+    def __init__(self, bclk=10, lrclk=11, din=9, rate=22050, tone_hz=880,
+                 mode='siren', f_lo=750, f_hi=1200, cycle_ms=700, frame_nsamp=512):
         self._i2s = None
         self._running = False
         self._buf = None
         self._rate = rate
         self._tone = tone_hz
+        self._mode = mode or 'siren'
+        self._f_lo = int(f_lo)
+        self._f_hi = int(f_hi)
+        self._cycle_ms = int(cycle_ms)
+        # Streaming synth state
+        self._tbl_len = 1024
+        self._tbl_mask = self._tbl_len - 1
+        self._tbl = None
+        self._out = None
+        self._frame_nsamp = max(128, int(frame_nsamp))
+        self._phase = 0.0
+        self._lfo_phase = 0.0
         self.ok = False
         if I2S is None or Pin is None:
             print("I2S not available on this firmware")
@@ -36,6 +50,13 @@ class AudioAlarm:
                 rate=self._rate,
                 ibuf=20000,
             )
+            # Build sine table and output buffer for streaming synthesis
+            amp = 15000
+            self._tbl = array.array('h', (0 for _ in range(self._tbl_len)))
+            for i in range(self._tbl_len):
+                self._tbl[i] = int(amp * math.sin(2 * math.pi * i / self._tbl_len))
+            self._out = array.array('h', (0 for _ in range(self._frame_nsamp)))
+            # Fallback static tone buffer for legacy pollers (not used in siren mode)
             self._buf = self._make_tone_chunk(self._rate, self._tone)
             self.ok = True
         except Exception as e:
@@ -58,16 +79,37 @@ class AudioAlarm:
     def start(self):
         if not self.ok or self._running:
             return
-        # Polled mode: a background worker should call poll() frequently
+        # Polled mode: main loop calls poll() frequently
         self._running = True
 
     def poll(self):
         if not self.ok or not self._running:
             return
+        # Streaming synthesis: fill a small frame and write
         try:
-            self._i2s.write(self._buf)
+            # LFO increment per sample (triangle 0..1..0 over cycle_ms)
+            total_lfo_samp = max(1, int(self._rate * max(200, self._cycle_ms) / 1000))
+            lfo_inc = 1.0 / total_lfo_samp
+            for i in range(self._frame_nsamp):
+                # Triangle LFO
+                p = self._lfo_phase
+                tri = 1.0 - abs(2.0 * p - 1.0)
+                if self._mode == 'siren':
+                    freq = self._f_lo + tri * (self._f_hi - self._f_lo)
+                else:
+                    freq = self._tone
+                inc = (self._tbl_len * freq) / self._rate
+                idx = int(self._phase) & self._tbl_mask
+                self._out[i] = self._tbl[idx]
+                self._phase += inc
+                if self._phase >= self._tbl_len:
+                    self._phase -= self._tbl_len
+                self._lfo_phase += lfo_inc
+                if self._lfo_phase >= 1.0:
+                    self._lfo_phase -= 1.0
+            # Write directly from the array (supports buffer protocol)
+            self._i2s.write(self._out)
         except Exception:
-            # Briefly yield if buffer not ready
             time.sleep_ms(1)
 
     def _loop(self):
