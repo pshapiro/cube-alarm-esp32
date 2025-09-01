@@ -8,7 +8,7 @@ except ImportError:
 import time
 import _thread
 from micropython import const
-from machine import Pin, I2C
+from machine import Pin, I2C, RTC
 import ssd1306
 from gan_mpy import derive_key_iv_from_mac, decrypt_packet, encrypt_packet
 from audio_alarm import AudioAlarm
@@ -20,6 +20,7 @@ KNOWN_MAC   = "CF:AA:79:C9:96:9C"  # <- your cube's public MAC (normal big‑end
 DEBUG_SCAN  = const(0)
 DEBUG_SCAN_RATE_MS = const(200)  # throttle when DEBUG_SCAN is enabled
 BTN_LONG_MS = const(1200)  # long-press threshold for manual alarm stop
+ALARM_PREP_SEC = const(10)  # start cube polling this many seconds before alarm
 
 # GAN Gen3 UUIDs
 SERVICE_UUID = bluetooth.UUID('8653000a-43e6-47b7-9cb0-5fc21d4ae340')
@@ -59,6 +60,9 @@ _conn = None
 _connecting = False
 _audio = None
 _alarm_on = False
+_alarm_time = None  # (hour, minute)
+_polling = False    # whether cube polling is active
+_mode = 'normal'    # button UI mode
 _char_discover_in_progress = False  # legacy var, not used in reverted flow
 _char_discover_start_ms = 0         # legacy var, not used in reverted flow
 _char_discover_item = None          # legacy var, not used in reverted flow
@@ -155,9 +159,10 @@ _btn_b = None
 _ui_last_sec = -1
 _btn_a_last = 1
 _btn_b_last = 1
+_btn_a_press_ms = 0
+_btn_b_press_ms = 0
 _btn_a_next_ok_ms = 0
 _btn_b_next_ok_ms = 0
-_btn_b_press_ms = 0
 
 def _ui_text(line1="", line2=""):
     # Only mark desired UI state; actual drawing happens in background thread
@@ -265,7 +270,7 @@ def _ui_init():
     try:
         i2c = I2C(1, sda=Pin(2), scl=Pin(3), freq=100000)
         _oled = ssd1306.SSD1306_I2C(128, 32, i2c, addr=0x3C)
-        _ui_text("Scanning...", "Twist to wake")
+        _ui_text("Ready", "Set alarm")
     except Exception as e:
         print("OLED init failed:", e)
         _oled = None
@@ -273,15 +278,13 @@ def _ui_init():
     print("UI: Skipping thread to avoid core1 conflicts")
 
 def _buttons_init():
-    global _btn_a, _btn_b, _btn_a_last, _btn_b_last, _buttons_thread_running, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _btn_b_press_ms
+    global _btn_a, _btn_b, _btn_a_last, _btn_b_last, _buttons_thread_running, _btn_a_press_ms, _btn_b_press_ms
     try:
         _btn_a = Pin(14, Pin.IN, Pin.PULL_UP)
         _btn_b = Pin(15, Pin.IN, Pin.PULL_UP)
         _btn_a_last = _btn_a.value()
         _btn_b_last = _btn_b.value()
-        t0 = time.ticks_ms()
-        _btn_a_next_ok_ms = t0
-        _btn_b_next_ok_ms = t0
+        _btn_a_press_ms = 0
         _btn_b_press_ms = 0
         # No separate button thread; buttons are polled in _ui_loop to avoid core1 contention
     except Exception as e:
@@ -289,33 +292,115 @@ def _buttons_init():
         _btn_a = None
         _btn_b = None
 
-def _buttons_loop():
-    # Simple edge-detect on pull-up buttons: send commands on press
-    global _btn_a_last, _btn_b_last
-    while True:
+def _fmt_hm(h, m):
+    return "%02d:%02d" % (h, m)
+
+
+def _rtc():
+    try:
+        return RTC()
+    except Exception:
+        return None
+
+
+def _inc_time_hour():
+    rtc = _rtc()
+    if rtc:
+        dt = list(rtc.datetime())
+        dt[4] = (dt[4] + 1) % 24
+        rtc.datetime(tuple(dt))
+        _ui_text("Set time", _fmt_hm(dt[4], dt[5]))
+
+
+def _inc_time_minute():
+    rtc = _rtc()
+    if rtc:
+        dt = list(rtc.datetime())
+        dt[5] = (dt[5] + 1) % 60
+        rtc.datetime(tuple(dt))
+        _ui_text("Set time", _fmt_hm(dt[4], dt[5]))
+
+
+def _inc_alarm_hour():
+    global _alarm_time
+    if _alarm_time is None:
+        _alarm_time = [0, 0]
+    _alarm_time[0] = (_alarm_time[0] + 1) % 24
+    _ui_text("Set alarm", _fmt_hm(_alarm_time[0], _alarm_time[1]))
+
+
+def _inc_alarm_minute():
+    global _alarm_time
+    if _alarm_time is None:
+        _alarm_time = [0, 0]
+    _alarm_time[1] = (_alarm_time[1] + 1) % 60
+    _ui_text("Set alarm", _fmt_hm(_alarm_time[0], _alarm_time[1]))
+
+
+def set_time(h, m, s=0):
+    rtc = _rtc()
+    if rtc:
+        dt = list(rtc.datetime())
+        dt[4] = int(h) % 24
+        dt[5] = int(m) % 60
+        dt[6] = int(s) % 60
+        rtc.datetime(tuple(dt))
+        _ui_text("Time set", _fmt_hm(dt[4], dt[5]))
+
+
+def set_alarm(h, m):
+    global _alarm_time
+    _alarm_time = [int(h) % 24, int(m) % 60]
+    _ui_text("Alarm set", _fmt_hm(_alarm_time[0], _alarm_time[1]))
+    return tuple(_alarm_time)
+
+
+def set_alarm_in(seconds):
+    now = time.localtime()
+    total = now[3] * 3600 + now[4] * 60 + now[5] + int(seconds)
+    total %= 86400
+    h = total // 3600
+    m = (total % 3600) // 60
+    return set_alarm(h, m)
+
+
+def start_cube_polling():
+    global _polling
+    if ble is None or _polling:
+        return
+    try:
+        ble.gap_scan(SCAN_MS, 30000, 30000, True)
+        _polling = True
+        print("Started scanning for cube")
+        _ui_text("Scanning...", "Twist to wake")
+    except Exception as e:
+        print("scan start err:", e)
+
+
+def stop_cube_polling():
+    global _polling, _conn, _connecting
+    if ble and _polling:
         try:
-            if _btn_a is not None:
-                a = _btn_a.value()
-                if _btn_a_last == 1 and a == 0:
-                    send_request_facelets()
-                _btn_a_last = a
-            if _btn_b is not None:
-                b = _btn_b.value()
-                if _btn_b_last == 1 and b == 0:
-                    send_request_reset()
-                _btn_b_last = b
+            ble.gap_scan(None)
         except Exception:
             pass
-        time.sleep_ms(80)
+        _polling = False
+    if ble and _conn is not None:
+        try:
+            ble.gap_disconnect(_conn)
+        except Exception:
+            pass
+        _conn = None
+    _connecting = False
 
 
 def _poll_tick():
     """Single cooperative tick: UI draw, buttons, audio, and deferred facelets writes."""
-    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_next_ok_ms, _btn_b_next_ok_ms, _alarm_on, _btn_b_press_ms, _notify_queue
+    global _ui_dirty, _ui_last_sec, _btn_a_last, _btn_b_last, _btn_a_press_ms, _btn_b_press_ms, _alarm_on, _notify_queue
     global _facelets_retry_count, _facelets_retry_next_ms, _last_write_ealready
     global _cccd_queue, _initial_facelets_pending, _did_send_initial_facelets, _cmd_handle, _state_handle, _discovery_complete_pending, _state_cccd_enabled, _initial_facelets_deadline_ms
     global _first_facelets_wr_mode0
-    global _ble_next_ok_ms
+    global _ble_next_ok_ms, _alarm_time, _polling, _mode
     try:
         # UI draw once per second or when marked dirty
         now = time.localtime()
@@ -324,13 +409,32 @@ def _poll_tick():
             _ui_dirty = False
             _ui_last_sec = now[5]
 
-        # Buttons and deferred tasks
+        # Buttons and alarm/time setting
         now_ms = time.ticks_ms()
         if _btn_a is not None:
             a = _btn_a.value()
-            if _btn_a_last == 1 and a == 0 and time.ticks_diff(now_ms, _btn_a_next_ok_ms) >= 0:
-                send_request_facelets()
-                _btn_a_next_ok_ms = time.ticks_add(now_ms, 200)
+            if _btn_a_last == 1 and a == 0:
+                _btn_a_press_ms = now_ms
+            elif _btn_a_last == 0 and a == 1:
+                dur = time.ticks_diff(now_ms, _btn_a_press_ms) if _btn_a_press_ms else 0
+                if dur >= BTN_LONG_MS:
+                    if _mode == 'normal':
+                        _mode = 'set_time'
+                        rtc = _rtc()
+                        if rtc:
+                            dt = rtc.datetime()
+                            _ui_text('Set time', _fmt_hm(dt[4], dt[5]))
+                    elif _mode == 'set_time':
+                        _mode = 'normal'
+                        _ui_text('', '')
+                    elif _mode == 'set_alarm':
+                        _inc_alarm_hour()
+                else:
+                    if _mode == 'set_time':
+                        _inc_time_hour()
+                    elif _mode == 'set_alarm':
+                        _inc_alarm_hour()
+                _btn_a_press_ms = 0
             _btn_a_last = a
         if _btn_b is not None:
             b = _btn_b.value()
@@ -339,24 +443,46 @@ def _poll_tick():
             elif _btn_b_last == 0 and b == 1:
                 dur = time.ticks_diff(now_ms, _btn_b_press_ms) if _btn_b_press_ms else 0
                 if dur >= BTN_LONG_MS:
-                    # Long press: stop alarm
                     if _alarm_on and _audio:
                         try:
                             _audio.stop()
                         except Exception:
                             pass
                         _alarm_on = False
-                        _ui_text("Alarm off", "")
+                        stop_cube_polling()
+                        _ui_text('Alarm off', '')
+                    elif _mode == 'normal':
+                        _mode = 'set_alarm'
+                        if _alarm_time is None:
+                            hh, mm = 0, 0
+                        else:
+                            hh, mm = _alarm_time
+                        _ui_text('Set alarm', _fmt_hm(hh, mm))
+                    elif _mode == 'set_alarm':
+                        _mode = 'normal'
+                        _ui_text('', '')
+                    elif _mode == 'set_time':
+                        _inc_time_minute()
                 else:
-                    # Short press: reset cube
-                    if time.ticks_diff(now_ms, _btn_b_next_ok_ms) >= 0:
-                        send_request_reset()
-                        try:
-                            _btn_b_next_ok_ms = time.ticks_add(now_ms, 200)
-                        except Exception:
-                            _btn_b_next_ok_ms = now_ms + 200
+                    if _mode == 'set_time':
+                        _inc_time_minute()
+                    elif _mode == 'set_alarm':
+                        _inc_alarm_minute()
                 _btn_b_press_ms = 0
             _btn_b_last = b
+
+        # Alarm scheduling
+        if _alarm_time is not None:
+            now_sec = now[3] * 3600 + now[4] * 60 + now[5]
+            alarm_sec = _alarm_time[0] * 3600 + _alarm_time[1] * 60
+            delta = (alarm_sec - now_sec) % 86400
+            if (not _polling) and (delta <= ALARM_PREP_SEC):
+                start_cube_polling()
+            if (not _alarm_on) and delta == 0:
+                if _audio and getattr(_audio, 'ok', False):
+                    _audio.start()
+                    _alarm_on = True
+                    _ui_text('Alarm!', 'Twist to wake')
 
         # Service audio alarm
         if _alarm_on and _audio:
@@ -1160,6 +1286,7 @@ def _on_notify(conn_handle, value_handle, data):
                         except Exception:
                             pass
                         _alarm_on = False
+                        stop_cube_polling()
                 else:
                     print("Cube not solved")
                     _ui_text("Connected", "Not solved")
@@ -1200,7 +1327,7 @@ def _irq(event, data):
     global _char_discover_in_progress, _char_discover_start_ms, _char_discover_item
     global _service_discover_in_progress, _service_discover_start_ms, _service_discover_pending
     global _ble_next_ok_ms, _notify_queue, _notify_drop_count, _cccd_queue, _discovery_complete_pending
-    global _state_cccd_enabled, _initial_facelets_deadline_ms
+    global _state_cccd_enabled, _initial_facelets_deadline_ms, _polling
 
     # Scan results
     if _is_scan_result_event(event, data):
@@ -1233,12 +1360,12 @@ def _irq(event, data):
 
     elif event == _IRQ_SCAN_DONE:
         print("Scan done.")
-        if _conn is None:
+        if _polling and _conn is None:
             if _connecting:
                 _ui_text("Connecting...", "")
             else:
                 _ui_text("Rescanning...", "")
-                # restart scanning indefinitely
+                # restart scanning indefinitely while polling is active
                 try:
                     ble.gap_scan(0, 30000, 30000, True)
                 except Exception as e:
@@ -1309,11 +1436,12 @@ def _irq(event, data):
             _facelets_retry_count = 0
             _facelets_retry_next_ms = 0
             _facelets_rate_next_ms = 0
-            # restart scanning after disconnect
-            try:
-                ble.gap_scan(0, 30000, 30000, True)
-            except Exception as e:
-                print("scan restart err:", e)
+            # restart scanning after disconnect only if polling is active
+            if _polling:
+                try:
+                    ble.gap_scan(0, 30000, 30000, True)
+                except Exception as e:
+                    print("scan restart err:", e)
 
     # Service discovery
     elif event == _IRQ_GATTC_SERVICE_RESULT:
@@ -1433,22 +1561,13 @@ def run():
     _ui_init()
     _buttons_init()
     ble.irq(_irq)
-    # Start alarm immediately; keep until cube is solved or manually stopped
+    # Pre-initialize audio but do not start until alarm fires
     try:
         if _audio is None:
             _audio = AudioAlarm(10, 11, 9)
-        if _audio and getattr(_audio, 'ok', False) and not _alarm_on:
-            _audio.start()
-            _alarm_on = True
-            _ui_text("Alarm!", "Twist to wake")
     except Exception as e:
-        print("Audio start failed:", e)
-    # Active scan with wide window (interval=window to be continuously listening)
-    # ble.gap_scan(duration_ms, interval_us, window_us, active)
-    _ui_text("Scanning...", "Twist to wake")
-    # Scan in 10s windows, auto-rescan in IRQ if not connected
-    ble.gap_scan(SCAN_MS, 30000, 30000, True)
-    print("Scanning {} ms windows… auto-rescanning until found.".format(SCAN_MS))
+        print("Audio init failed:", e)
+    _ui_text("Ready", "Set alarm")
     # Cooperative main loop to service buttons, audio, and deferred facelets requests
     while True:
         _poll_tick()
