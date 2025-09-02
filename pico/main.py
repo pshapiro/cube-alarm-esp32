@@ -205,13 +205,37 @@ def _ui_draw(now_tuple=None):
             now_tuple = time.localtime()
         hh, mm = now_tuple[3], now_tuple[4]
         ampm = "AM" if hh < 12 else "PM"
-        hh = hh % 12
-        if hh == 0:
-            hh = 12
-        t = "%d:%02d" % (hh, mm)
+        hh12 = hh % 12
+        if hh12 == 0:
+            hh12 = 12
+        t = "%d:%02d" % (hh12, mm)
+        # Decide a single bottom line: show mode/status over AM/PM when relevant
+        bottom = None
+        # Prefer showing active setting modes
+        if _mode == 'set_alarm':
+            if _alarm_time is None:
+                ah, am = 0, 0
+            else:
+                ah, am = _alarm_time
+            bottom = "Alarm %02d:%02d" % (ah % 24, am % 60)
+        elif _mode == 'set_time':
+            bottom = "Set time"
+        # Otherwise surface most recent UI text if present
+        elif _ui_line2:
+            bottom = _ui_line2
+        elif _ui_line1:
+            bottom = _ui_line1
+        # Fallback to AM/PM when no status to show
+        if not bottom:
+            bottom = ampm
+
         _oled.fill(0)
         _draw_text_big(_oled, t, 0, 0, 3)
-        _oled.text(ampm, 128 - len(ampm) * 8, 24)
+        # Draw bottom line right-aligned if AM/PM, else left-aligned status
+        if bottom in ("AM", "PM"):
+            _oled.text(bottom, 128 - len(bottom) * 8, 24)
+        else:
+            _oled.text(bottom, 0, 24)
         _oled.show()
     except Exception as e:
         # Avoid crashing UI loop on transient I2C errors
