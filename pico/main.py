@@ -7,6 +7,10 @@ except ImportError:
     import bluetooth
 import time
 import _thread
+try:
+    import framebuf
+except ImportError:  # pragma: no cover - environment without framebuf
+    framebuf = None
 from micropython import const
 from machine import Pin, I2C, RTC
 import ssd1306
@@ -171,20 +175,43 @@ def _ui_text(line1="", line2=""):
     _ui_line2 = line2 or ""
     _ui_dirty = True
 
+
+def _draw_text_big(fb, text, x, y, scale=2):
+    """Render scaled text. Falls back to normal size if framebuf missing."""
+    if framebuf is None:
+        fb.text(text, x, y, 1)
+        return
+
+    buf = framebuf.FrameBuffer(bytearray(8 * 8), 8, 8, framebuf.MONO_VLSB)
+    for i, ch in enumerate(text):
+        buf.fill(0)
+        buf.text(ch, 0, 0, 1)
+        for yy in range(8):
+            for xx in range(8):
+                if buf.pixel(xx, yy):
+                    fb.fill_rect(
+                        x + i * 8 * scale + xx * scale,
+                        y + yy * scale,
+                        scale,
+                        scale,
+                        1,
+                    )
+
 def _ui_draw(now_tuple=None):
     if _oled is None:
         return
     try:
         if now_tuple is None:
             now_tuple = time.localtime()
-        hh, mm, ss = now_tuple[3], now_tuple[4], now_tuple[5]
-        t = "%02d:%02d:%02d" % (hh, mm, ss)
+        hh, mm = now_tuple[3], now_tuple[4]
+        ampm = "AM" if hh < 12 else "PM"
+        hh = hh % 12
+        if hh == 0:
+            hh = 12
+        t = "%d:%02d" % (hh, mm)
         _oled.fill(0)
-        _oled.text(t, 0, 0)
-        if _ui_line1:
-            _oled.text(_ui_line1[:16], 0, 10)
-        if _ui_line2:
-            _oled.text(_ui_line2[:16], 0, 20)
+        _draw_text_big(_oled, t, 0, 0, 3)
+        _oled.text(ampm, 128 - len(ampm) * 8, 24)
         _oled.show()
     except Exception as e:
         # Avoid crashing UI loop on transient I2C errors
