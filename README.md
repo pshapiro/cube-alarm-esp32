@@ -11,6 +11,7 @@ MicroPython firmware that turns a GAN Bluetooth cube into an alarm clock.
 - The cube is only polled shortly before the alarm (about 10 seconds) to avoid
   draining its battery.
 - Stop the alarm by solving the cube or long‑pressing **B**.
+- The OLED display shows the current time in a large 12‑hour format.
 
 ## REPL helpers
 
