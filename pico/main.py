@@ -217,9 +217,9 @@ def _ui_draw(now_tuple=None):
                 ah, am = 0, 0
             else:
                 ah, am = _alarm_time
-            bottom = "Alarm %02d:%02d" % (ah % 24, am % 60)
+            bottom = "Alarm %s" % _fmt_hm(ah, am)
         elif _mode == 'set_time':
-            bottom = "Set time"
+            bottom = "Set time %s" % ("am" if hh < 12 else "pm")
         # Otherwise surface most recent UI text if present
         elif _ui_line2:
             bottom = _ui_line2
@@ -344,7 +344,12 @@ def _buttons_init():
         _btn_b = None
 
 def _fmt_hm(h, m):
-    return "%02d:%02d" % (h, m)
+    """Format hour/minute in 12‑hour time with am/pm."""
+    ampm = "am" if (h % 24) < 12 else "pm"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return "%d:%02d %s" % (h12, m % 60, ampm)
 
 
 def _rtc():
